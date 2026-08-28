@@ -217,25 +217,85 @@ def _query_limit(settings: Settings, limit: int | None, database: str | None = N
 
 
 def _extract_dml_table(sql: str) -> str | None:
-    """Best-effort table name extraction for UPDATE/DELETE to support WHERE-exempt allowlist."""
+    """Extract single-table target for UPDATE/DELETE, or None for multi-table/complex DML.
+
+    Returns the table name only for simple single-table statements.  Multi-table
+    forms like ``UPDATE t JOIN ...`` or ``DELETE t1, t2 FROM ...`` return None
+    so the WHERE-exempt allowlist is not applied.
+    """
     try:
         import sqlparse
+        from sqlparse.tokens import Keyword
         parsed = sqlparse.parse(sql)
         if not parsed:
             return None
         stmt = parsed[0]
+        # Quick reject: JOIN or comma in the statement generally means multi-table
+        normalized = " ".join(t.value for t in stmt.flatten()).upper()
+        # Use regex-free check: look for JOIN keyword or comma before SET/WHERE
         tokens = [t for t in stmt.tokens if not t.is_whitespace]
-        # UPDATE <table> SET ...  or DELETE FROM <table> WHERE ...
+        if not tokens:
+            return None
         first = (tokens[0].value if tokens else "").upper()
-        if first == "UPDATE" and len(tokens) >= 2:
-            # second token is table (may be `db.table`)
-            cand = tokens[1].value.strip().split()[0].strip("`")
-            return cand.split(".")[-1]
+        if first == "UPDATE":
+            # Find SET keyword position
+            set_idx = None
+            for idx, tok in enumerate(tokens):
+                if tok.ttype is Keyword and tok.value.upper() == "SET":
+                    set_idx = idx
+                    break
+                # sqlparse may classify SET as DML, check string
+                if tok.value.upper() == "SET":
+                    set_idx = idx
+                    break
+            if set_idx is None or set_idx < 2:
+                return None
+            # Everything between table and SET must be a single identifier (no JOIN, comma)
+            between = tokens[1:set_idx]
+            if len(between) != 1:
+                return None
+            # If the single token contains JOIN or comma, it's multi-table
+            raw = between[0].value.strip()
+            if "," in raw or "JOIN" in raw.upper():
+                return None
+            # Also check normalized contains JOIN before SET
+            set_pos = normalized.find(" SET ")
+            before_set = normalized[:set_pos] if set_pos != -1 else ""
+            if " JOIN " in before_set or "," in before_set:
+                return None
+            cand = raw.split()[0].strip("`")
+            return cand.split(".")[-1] if cand else None
         if first == "DELETE":
-            for i, tok in enumerate(tokens):
-                if tok.value.upper() == "FROM" and i + 1 < len(tokens):
-                    cand = tokens[i + 1].value.strip().split()[0].strip("`")
-                    return cand.split(".")[-1]
+            # DELETE has forms: DELETE FROM tbl WHERE ... (single) vs DELETE t1, t2 FROM ... (multi)
+            # Find FROM
+            from_idx = None
+            for idx, tok in enumerate(tokens):
+                if tok.value.upper() == "FROM":
+                    from_idx = idx
+                    break
+            if from_idx is None:
+                return None
+            # If there's anything between DELETE and FROM besides optional whitespace, it's multi-target
+            # e.g. DELETE t1, t2 FROM ... -> tokens[1] would be "t1, t2"
+            if from_idx != 1:
+                # tokens[1] exists and is not FROM -> multi-table delete
+                return None
+            if from_idx + 1 >= len(tokens):
+                return None
+            cand_token = tokens[from_idx + 1]
+            raw = cand_token.value.strip()
+            if "," in raw or "JOIN" in raw.upper():
+                return None
+            # Check normalized after FROM before WHERE for JOIN/comma (multi-table)
+            from_pos = normalized.find(" FROM ")
+            where_pos = normalized.find(" WHERE ")
+            after_from = normalized[from_pos:where_pos if where_pos != -1 else len(normalized)]
+            if " JOIN " in after_from:
+                return None
+            if "," in after_from.replace(" FROM ", "", 1):
+                return None
+            cand = raw.split()[0].strip("`")
+            return cand.split(".")[-1] if cand else None
     except Exception:
         pass
     return None
@@ -245,7 +305,7 @@ def _resolve_write_require_where(settings: Settings, sql: str, database: str | N
     base = settings.effective_write_require_where(database)
     if not base:
         return False
-    # check allowlist
+    # Only single-table DML may use the exempt allowlist; multi-table DML always requires WHERE
     table = _extract_dml_table(sql)
     if table and settings.is_write_where_exempt(table):
         return False
@@ -268,6 +328,9 @@ def run_query(
     without hitting the database, useful for preflight.
     """
     assert_select_only(sql)
+    if offset is not None:
+        if isinstance(offset, bool) or offset < 0:
+            raise QueryError("offset must be a non-negative integer")
     row_limit = _query_limit(settings, limit, database)
     timeout = settings.effective_query_timeout(database)
     if dry_run:
@@ -280,9 +343,6 @@ def run_query(
             "offset": offset or 0,
             "database": settings.database(database).id,
         }
-    if offset is not None:
-        if isinstance(offset, bool) or offset < 0:
-            raise QueryError("offset must be a non-negative integer")
     # DictCursor buffers the complete result during execute(). Streaming here
     # makes the output limit a client-memory bound as well as a response bound.
     with _connection(
@@ -358,12 +418,13 @@ def execute_write(
     assert_write_only(sql, require_where=require_where)
     max_rows = settings.effective_write_max_affected_rows(selected.id)
     if dry_run:
-        # Try EXPLAIN first for a cheap estimate, fallback to rollback execution
+        # dry_run must never mutate data. Use EXPLAIN only; do not fall back to
+        # executing the DML and rolling back (unsafe for MyISAM / triggers).
         try:
             timeout = settings.effective_query_timeout(selected.id)
             with _connection(settings, selected.id, timeout_seconds=timeout) as conn:
                 with conn.cursor() as cursor:
-                    # EXPLAIN on DML works on MySQL 8.0.19+
+                    # EXPLAIN on DML works on MySQL 8.0.19+; on older versions this raises
                     cursor.execute(f"EXPLAIN {sql}", params or [])
                     plan = list(cursor.fetchall())
                     return {
@@ -373,26 +434,10 @@ def execute_write(
                         "max_affected_rows": max_rows,
                         "require_where": require_where,
                     }
-        except Exception:
-            pass
-        with _connection(
-            settings,
-            selected.id,
-            timeout_seconds=settings.write_timeout_seconds,
-            autocommit=False,
-        ) as conn:
-            with conn.cursor() as cursor:
-                conn.begin()
-                cursor.execute(sql, params or [])
-                affected_rows = cursor.rowcount
-                conn.rollback()
-                return {
-                    "database": selected.id,
-                    "dry_run": True,
-                    "affected_rows": affected_rows,
-                    "would_exceed_limit": affected_rows >= 0 and affected_rows > max_rows,
-                    "max_affected_rows": max_rows,
-                }
+        except Exception as exc:
+            raise QueryError(
+                f"dry_run not supported for this statement (EXPLAIN failed): {exc}"
+            ) from exc
     with _connection(
         settings,
         selected.id,
@@ -465,6 +510,8 @@ def execute_many(
                     if affected >= 0:
                         total_affected += affected
                         if total_affected > max_rows:
+                            # Safety limit breach must always rollback, even when atomic=False
+                            conn.rollback()
                             raise QueryError(
                                 f"batch write affects {total_affected} rows, exceeding limit {max_rows}"
                             )
@@ -473,6 +520,24 @@ def execute_many(
                         "last_insert_id": cursor.lastrowid,
                     })
                 conn.commit()
+            except QueryError:
+                # QueryError from limit breach already rolled back above; ensure other
+                # QueryErrors also rollback when atomic, but limit breach is always rollback
+                # Check if we already rolled back (total_affected > max_rows case)
+                # For limit breach we already rolled back, don't double-commit
+                try:
+                    # If we are here due to limit breach, the connection is already rolled back
+                    # For other QueryErrors, respect atomic flag
+                    if total_affected > max_rows:
+                        # already rolled back
+                        pass
+                    elif atomic:
+                        conn.rollback()
+                    else:
+                        conn.commit()
+                except Exception:
+                    pass
+                raise
             except Exception:
                 if atomic:
                     conn.rollback()

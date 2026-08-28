@@ -107,25 +107,149 @@ def _connection(
         conn.close()
 
 
+_IDENT_RE = __import__('re').compile(r"^[A-Za-z0-9_]+$")
+
+
+def _validate_identifier(name: str) -> str:
+    if not name or not _IDENT_RE.fullmatch(name):
+        raise QueryError(f"invalid identifier {name!r}")
+    return name
+
+
+def _quoted_table(table: str) -> str:
+    """Validate and quote a possibly qualified table name `schema.table`.
+
+    Allows `table` or `schema.table`, each part must be [A-Za-z0-9_].
+    Returns a backtick-quoted SQL fragment like `"`schema`"."`table`"`.
+    """
+    if not table or not isinstance(table, str):
+        raise QueryError("invalid table name")
+    raw = table.strip().strip("`").strip()
+    if not raw:
+        raise QueryError("invalid table name")
+    parts = raw.split(".")
+    if len(parts) > 2:
+        raise QueryError(f"invalid table name {table!r}: expected [schema.]table")
+    quoted = ".".join(f"`{_validate_identifier(p.strip().strip('`'))}`" for p in parts)
+    return quoted
+
+
 def describe_table(
     settings: Settings, table: str, *, database: str | None = None
 ) -> list[dict[str, Any]]:
-    if not table or not table.replace("_", "").isalnum():
-        raise QueryError("invalid table name")
-    with _connection(settings, database, timeout_seconds=settings.query_timeout_seconds) as conn:
+    quoted = _quoted_table(table)
+    timeout = settings.effective_query_timeout(database)
+    with _connection(settings, database, timeout_seconds=timeout) as conn:
         with conn.cursor() as cursor:
-            # `table` is allowlist-validated above; identifiers cannot be bound
-            # as MySQL parameters.
-            cursor.execute(f"DESCRIBE `{table}`")
+            cursor.execute(f"DESCRIBE {quoted}")
             return list(cursor.fetchall())
 
 
-def _query_limit(settings: Settings, limit: int | None) -> int:
+def list_tables(
+    settings: Settings,
+    *,
+    database: str | None = None,
+    schema: str | None = None,
+    pattern: str | None = None,
+    include_views: bool = True,
+) -> list[dict[str, Any]]:
+    """List tables/views visible in the current MySQL database.
+
+    Uses INFORMATION_SCHEMA so it works across MySQL versions without
+    relying on SHOW TABLES parsing. Filtering is done in SQL via LIKE.
+    """
+    timeout = settings.effective_query_timeout(database)
+    # Resolve default schema from DSN when not given
+    if schema is not None:
+        _validate_identifier(schema)
+        schema_filter = schema
+    else:
+        _, _, dsn_db = _parse_url(settings.database(database).dsn)
+        schema_filter = dsn_db
+
+    sql = (
+        "SELECT TABLE_NAME as name, TABLE_TYPE as type, ENGINE as engine, "
+        "TABLE_ROWS as approx_rows, CREATE_TIME as create_time, TABLE_COMMENT as comment "
+        "FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s"
+    )
+    params: list[Any] = [schema_filter]
+    if not include_views:
+        sql += " AND TABLE_TYPE = 'BASE TABLE'"
+    if pattern:
+        # Validate pattern is safe for LIKE: allow % _ and alnum
+        if len(pattern) > 64 or any(c in pattern for c in ("'", '"', ";", "\\")):
+            raise QueryError("invalid pattern")
+        sql += " AND TABLE_NAME LIKE %s"
+        params.append(pattern)
+    sql += " ORDER BY TABLE_NAME LIMIT 1000"
+    with _connection(settings, database, timeout_seconds=timeout) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            return list(cursor.fetchall())
+
+
+def explain_query(
+    settings: Settings,
+    sql: str,
+    params: list[Any] | None,
+    *,
+    database: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return MySQL EXPLAIN output for a SELECT without executing it fully.
+
+    Only SELECT/WITH is allowed; the EXPLAIN itself is bounded by the query timeout.
+    """
+    assert_select_only(sql)
+    timeout = settings.effective_query_timeout(database)
+    with _connection(settings, database, timeout_seconds=timeout) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(f"EXPLAIN {sql}", params or [])
+            return list(cursor.fetchall())
+
+
+def _query_limit(settings: Settings, limit: int | None, database: str | None = None) -> int:
+    cap = settings.effective_query_max_rows(database)
     if limit is None:
-        return settings.query_max_rows
+        return cap
     if isinstance(limit, bool) or limit < 1:
         raise QueryError("limit must be a positive integer")
-    return min(limit, settings.query_max_rows)
+    return min(limit, cap)
+
+
+def _extract_dml_table(sql: str) -> str | None:
+    """Best-effort table name extraction for UPDATE/DELETE to support WHERE-exempt allowlist."""
+    try:
+        import sqlparse
+        parsed = sqlparse.parse(sql)
+        if not parsed:
+            return None
+        stmt = parsed[0]
+        tokens = [t for t in stmt.tokens if not t.is_whitespace]
+        # UPDATE <table> SET ...  or DELETE FROM <table> WHERE ...
+        first = (tokens[0].value if tokens else "").upper()
+        if first == "UPDATE" and len(tokens) >= 2:
+            # second token is table (may be `db.table`)
+            cand = tokens[1].value.strip().split()[0].strip("`")
+            return cand.split(".")[-1]
+        if first == "DELETE":
+            for i, tok in enumerate(tokens):
+                if tok.value.upper() == "FROM" and i + 1 < len(tokens):
+                    cand = tokens[i + 1].value.strip().split()[0].strip("`")
+                    return cand.split(".")[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_write_require_where(settings: Settings, sql: str, database: str | None) -> bool:
+    base = settings.effective_write_require_where(database)
+    if not base:
+        return False
+    # check allowlist
+    table = _extract_dml_table(sql)
+    if table and settings.is_write_where_exempt(table):
+        return False
+    return True
 
 
 def run_query(
@@ -135,23 +259,47 @@ def run_query(
     limit: int | None,
     *,
     database: str | None = None,
-) -> list[dict[str, Any]]:
-    """Run a bounded exploratory query using a server-side cursor."""
-    assert_select_only(sql)
-    row_limit = _query_limit(settings, limit)
+    offset: int | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Run a bounded exploratory query using a server-side cursor.
 
+    When dry_run=True, returns {dry_run: True, sql, params, effective_limit, effective_timeout}
+    without hitting the database, useful for preflight.
+    """
+    assert_select_only(sql)
+    row_limit = _query_limit(settings, limit, database)
+    timeout = settings.effective_query_timeout(database)
+    if dry_run:
+        return {
+            "dry_run": True,
+            "sql": sql,
+            "params": params or [],
+            "effective_limit": row_limit,
+            "effective_timeout": timeout,
+            "offset": offset or 0,
+            "database": settings.database(database).id,
+        }
+    if offset is not None:
+        if isinstance(offset, bool) or offset < 0:
+            raise QueryError("offset must be a non-negative integer")
     # DictCursor buffers the complete result during execute(). Streaming here
     # makes the output limit a client-memory bound as well as a response bound.
     with _connection(
         settings,
         database,
-        timeout_seconds=settings.query_timeout_seconds,
+        timeout_seconds=timeout,
         streaming=True,
     ) as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params or [])
             rows: list[dict[str, Any]] = []
+            skipped = 0
+            target_offset = offset or 0
             for row in cursor:
+                if skipped < target_offset:
+                    skipped += 1
+                    continue
                 rows.append(row)
                 if len(rows) >= row_limit:
                     break
@@ -177,7 +325,7 @@ def stream_query(
     with _connection(
         settings,
         database,
-        timeout_seconds=settings.export_timeout_seconds,
+        timeout_seconds=settings.effective_export_timeout(database),
         streaming=True,
     ) as conn:
         with conn.cursor() as cursor:
@@ -193,15 +341,58 @@ def execute_write(
     params: list[Any] | None,
     *,
     database: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Execute one guarded DML statement in a transaction."""
+    """Execute one guarded DML statement in a transaction.
+
+    When dry_run=True, runs EXPLAIN (if supported) or a ROLLBACK transaction
+    to return the would-be affected_rows without committing.
+    """
     if not settings.write_enabled:
         raise QueryError("write operations are disabled (set BIZDB_WRITE_ENABLED=true)")
     selected = settings.database(database)
     if not selected.allow_writes:
         raise QueryError(f"writes are disabled for database {selected.id!r}")
 
-    assert_write_only(sql, require_where=settings.write_require_where)
+    require_where = _resolve_write_require_where(settings, sql, database)
+    assert_write_only(sql, require_where=require_where)
+    max_rows = settings.effective_write_max_affected_rows(selected.id)
+    if dry_run:
+        # Try EXPLAIN first for a cheap estimate, fallback to rollback execution
+        try:
+            timeout = settings.effective_query_timeout(selected.id)
+            with _connection(settings, selected.id, timeout_seconds=timeout) as conn:
+                with conn.cursor() as cursor:
+                    # EXPLAIN on DML works on MySQL 8.0.19+
+                    cursor.execute(f"EXPLAIN {sql}", params or [])
+                    plan = list(cursor.fetchall())
+                    return {
+                        "database": selected.id,
+                        "dry_run": True,
+                        "estimated_plan": plan,
+                        "max_affected_rows": max_rows,
+                        "require_where": require_where,
+                    }
+        except Exception:
+            pass
+        with _connection(
+            settings,
+            selected.id,
+            timeout_seconds=settings.write_timeout_seconds,
+            autocommit=False,
+        ) as conn:
+            with conn.cursor() as cursor:
+                conn.begin()
+                cursor.execute(sql, params or [])
+                affected_rows = cursor.rowcount
+                conn.rollback()
+                return {
+                    "database": selected.id,
+                    "dry_run": True,
+                    "affected_rows": affected_rows,
+                    "would_exceed_limit": affected_rows >= 0 and affected_rows > max_rows,
+                    "max_affected_rows": max_rows,
+                }
     with _connection(
         settings,
         selected.id,
@@ -212,14 +403,11 @@ def execute_write(
             conn.begin()
             cursor.execute(sql, params or [])
             affected_rows = cursor.rowcount
-            if (
-                affected_rows >= 0
-                and affected_rows > settings.write_max_affected_rows
-            ):
+            if affected_rows >= 0 and affected_rows > max_rows:
                 conn.rollback()
                 raise QueryError(
                     f"write affects {affected_rows} rows, exceeding "
-                    f"BIZDB_WRITE_MAX_AFFECTED_ROWS={settings.write_max_affected_rows}"
+                    f"limit {max_rows} (effective_write_max_affected_rows)"
                 )
             conn.commit()
             return {
@@ -227,3 +415,73 @@ def execute_write(
                 "affected_rows": affected_rows,
                 "last_insert_id": cursor.lastrowid,
             }
+
+
+def execute_many(
+    settings: Settings,
+    statements: list[dict[str, Any]],
+    *,
+    database: str | None = None,
+    atomic: bool = True,
+) -> dict[str, Any]:
+    """Execute multiple DML statements in a single transaction.
+
+    Each item is {sql: str, params?: list}. All are validated before any execution.
+    When atomic=True (default), either all commit or all rollback.
+    """
+    if not settings.write_enabled:
+        raise QueryError("write operations are disabled (set BIZDB_WRITE_ENABLED=true)")
+    selected = settings.database(database)
+    if not selected.allow_writes:
+        raise QueryError(f"writes are disabled for database {selected.id!r}")
+    if not statements or not isinstance(statements, list):
+        raise QueryError("statements must be a non-empty list")
+    if len(statements) > 100:
+        raise QueryError("too many statements (max 100 per call)")
+    # Pre-validate all
+    for idx, item in enumerate(statements):
+        if not isinstance(item, dict) or "sql" not in item:
+            raise QueryError(f"statements[{idx}] must be {{sql, params}}")
+        sql = item["sql"]
+        if not isinstance(sql, str) or not sql.strip():
+            raise QueryError(f"statements[{idx}].sql must be a non-empty string")
+        require_where = _resolve_write_require_where(settings, sql, selected.id)
+        assert_write_only(sql, require_where=require_where)
+    max_rows = settings.effective_write_max_affected_rows(selected.id)
+    total_affected = 0
+    results: list[dict[str, Any]] = []
+    with _connection(
+        settings,
+        selected.id,
+        timeout_seconds=settings.write_timeout_seconds,
+        autocommit=False,
+    ) as conn:
+        with conn.cursor() as cursor:
+            conn.begin()
+            try:
+                for item in statements:
+                    cursor.execute(item["sql"], item.get("params") or [])
+                    affected = cursor.rowcount
+                    if affected >= 0:
+                        total_affected += affected
+                        if total_affected > max_rows:
+                            raise QueryError(
+                                f"batch write affects {total_affected} rows, exceeding limit {max_rows}"
+                            )
+                    results.append({
+                        "affected_rows": affected,
+                        "last_insert_id": cursor.lastrowid,
+                    })
+                conn.commit()
+            except Exception:
+                if atomic:
+                    conn.rollback()
+                else:
+                    conn.commit()
+                raise
+    return {
+        "database": selected.id,
+        "total_affected_rows": total_affected,
+        "statement_count": len(results),
+        "results": results,
+    }

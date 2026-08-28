@@ -15,10 +15,13 @@ class SandboxPushError(RuntimeError):
     """Raised when pushing an exported file into Sandbox fails."""
 
 
-def _dataset_filename(dataset_name: str) -> str:
+def _dataset_filename(dataset_name: str, format: str = "parquet") -> str:
     name = dataset_name.strip()
-    if name.lower().endswith(".parquet"):
-        name = name[:-8]
+    # strip any known extension so callers can pass "foo.parquet" or "foo.csv"
+    for ext in (".parquet", ".csv", ".jsonl"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
     if (
         not name
         or name in {".", ".."}
@@ -28,7 +31,17 @@ def _dataset_filename(dataset_name: str) -> str:
         or any(ord(char) < 32 for char in name)
     ):
         raise SandboxPushError("dataset_name must be a safe file name")
-    return f"{name}.parquet"
+    ext_map = {"parquet": ".parquet", "csv": ".csv", "jsonl": ".jsonl"}
+    suffix = ext_map.get(format, ".parquet")
+    return f"{name}{suffix}"
+
+
+def _mime_for_format(format: str) -> str:
+    return {
+        "parquet": "application/vnd.apache.parquet",
+        "csv": "text/csv",
+        "jsonl": "application/x-ndjson",
+    }.get(format, "application/octet-stream")
 
 
 def push_dataset(
@@ -37,6 +50,7 @@ def push_dataset(
     identity: ExportIdentity,
     dataset_name: str,
     file_path: Path,
+    format: str = "parquet",
 ) -> dict:
     url = (
         f"{settings.sandbox_base_url}/sessions/"
@@ -55,9 +69,9 @@ def push_dataset(
         with file_path.open("rb") as fh:
             files = {
                 "file": (
-                    _dataset_filename(dataset_name),
+                    _dataset_filename(dataset_name, format),
                     fh,
-                    "application/vnd.apache.parquet",
+                    _mime_for_format(format),
                 )
             }
             resp = httpx.post(

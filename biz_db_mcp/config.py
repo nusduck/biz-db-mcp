@@ -8,10 +8,12 @@ Python dependency of this project.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -88,6 +90,13 @@ class DatabaseConfig:
     allow_writes: bool = False
     dbpm_database: str | None = None
     dbpm_user: str | None = None
+    # Per-database overrides (None = inherit from global Settings)
+    query_max_rows: int | None = None
+    query_timeout_seconds: int | None = None
+    export_max_rows: int | None = None
+    export_timeout_seconds: int | None = None
+    write_max_affected_rows: int | None = None
+    write_require_where: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +129,7 @@ class Settings:
 
     write_enabled: bool
     write_require_where: bool
+    write_require_where_except_tables: tuple[str, ...]
     write_max_affected_rows: int
     write_timeout_seconds: int
 
@@ -143,6 +153,65 @@ class Settings:
                 return database
         available = ", ".join(database.id for database in self.databases)
         raise ConfigError(f"unknown database {selected!r}; available: {available}")
+
+    # ---- per-database effective values ----
+    def effective_query_max_rows(self, database_id: str | None = None) -> int:
+        db = self.database(database_id)
+        return db.query_max_rows if db.query_max_rows is not None else self.query_max_rows
+
+    def effective_query_timeout(self, database_id: str | None = None) -> int:
+        db = self.database(database_id)
+        return db.query_timeout_seconds if db.query_timeout_seconds is not None else self.query_timeout_seconds
+
+    def effective_export_max_rows(self, database_id: str | None = None) -> int:
+        db = self.database(database_id)
+        return db.export_max_rows if db.export_max_rows is not None else self.export_max_rows
+
+    def effective_export_timeout(self, database_id: str | None = None) -> int:
+        db = self.database(database_id)
+        return db.export_timeout_seconds if db.export_timeout_seconds is not None else self.export_timeout_seconds
+
+    def effective_write_max_affected_rows(self, database_id: str | None = None) -> int:
+        db = self.database(database_id)
+        return db.write_max_affected_rows if db.write_max_affected_rows is not None else self.write_max_affected_rows
+
+    def effective_write_require_where(self, database_id: str | None = None) -> bool:
+        db = self.database(database_id)
+        return db.write_require_where if db.write_require_where is not None else self.write_require_where
+
+    def is_write_where_exempt(self, table: str) -> bool:
+        if not table:
+            return False
+        name = table.strip().lower()
+        for pattern in self.write_require_where_except_tables:
+            if fnmatch.fnmatch(name, pattern.lower()):
+                return True
+        return False
+
+
+def _parse_per_db_int(raw: dict[str, Any], database_id: str, key: str, *, minimum: int = 1) -> int | None:
+    if key not in raw or raw[key] is None:
+        return None
+    value = raw[key]
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < minimum:
+            raise ConfigError(f"{database_id}.{key} must be >= {minimum}, got {value}")
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            iv = int(value.strip())
+        except ValueError as exc:
+            raise ConfigError(f"{database_id}.{key} must be an integer, got {value!r}") from exc
+        if iv < minimum:
+            raise ConfigError(f"{database_id}.{key} must be >= {minimum}, got {iv}")
+        return iv
+    raise ConfigError(f"{database_id}.{key} must be an integer")
+
+
+def _parse_per_db_bool(raw: dict[str, Any], database_id: str, key: str) -> bool | None:
+    if key not in raw or raw[key] is None:
+        return None
+    return _coerce_bool(raw[key], f"{database_id}.{key}")
 
 
 def _database_from_entry(database_id: str, raw: Any) -> DatabaseConfig:
@@ -181,13 +250,38 @@ def _database_from_entry(database_id: str, raw: Any) -> DatabaseConfig:
         allow_writes=allow_writes,
         dbpm_database=dbpm_database.strip() if isinstance(dbpm_database, str) else None,
         dbpm_user=dbpm_user.strip() if isinstance(dbpm_user, str) else None,
+        query_max_rows=_parse_per_db_int(raw, database_id, "query_max_rows"),
+        query_timeout_seconds=_parse_per_db_int(raw, database_id, "query_timeout_seconds"),
+        export_max_rows=_parse_per_db_int(raw, database_id, "export_max_rows"),
+        export_timeout_seconds=_parse_per_db_int(raw, database_id, "export_timeout_seconds"),
+        write_max_affected_rows=_parse_per_db_int(raw, database_id, "write_max_affected_rows"),
+        write_require_where=_parse_per_db_bool(raw, database_id, "write_require_where"),
     )
+
+
+def _load_databases_from_file() -> str | None:
+    path = os.environ.get("BIZDB_DATABASES_FILE", "").strip()
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"BIZDB_DATABASES_FILE not found: {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read BIZDB_DATABASES_FILE {path}: {exc}") from exc
+    if not text.strip():
+        raise ConfigError(f"BIZDB_DATABASES_FILE {path} is empty")
+    return text.strip()
 
 
 def _load_databases() -> tuple[DatabaseConfig, ...]:
     raw = os.environ.get("BIZDB_DATABASES_JSON", "").strip()
     if not raw:
         raw = os.environ.get("BIZDB_DATABASES", "").strip()
+    if not raw:
+        file_raw = _load_databases_from_file()
+        if file_raw is not None:
+            raw = file_raw
 
     if not raw:
         return (DatabaseConfig(id="primary", dsn=_require("BIZDB_MYSQL_DSN")),)
@@ -247,6 +341,19 @@ def _load_dbpm() -> DbpmSettings:
     )
 
 
+def _load_write_except_tables() -> tuple[str, ...]:
+    raw = os.environ.get("BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES", "").strip()
+    if not raw:
+        return ()
+    # allow comma or whitespace separated, support glob patterns like cache_*, temp_*
+    parts: list[str] = []
+    for chunk in raw.replace(",", " ").split():
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    return tuple(parts)
+
+
 def load_settings() -> Settings:
     databases = _load_databases()
     default_database = os.environ.get("BIZDB_DEFAULT_DATABASE", databases[0].id).strip()
@@ -258,6 +365,7 @@ def load_settings() -> Settings:
         default_database=default_database,
         write_enabled=_optional_bool("BIZDB_WRITE_ENABLED", False),
         write_require_where=_optional_bool("BIZDB_WRITE_REQUIRE_WHERE", True),
+        write_require_where_except_tables=_load_write_except_tables(),
         write_max_affected_rows=_optional_int("BIZDB_WRITE_MAX_AFFECTED_ROWS", 1_000),
         write_timeout_seconds=_optional_int("BIZDB_WRITE_TIMEOUT_SECONDS", 30),
         sandbox_base_url=_base_url(_require("BIZDB_SANDBOX_BASE_URL")),

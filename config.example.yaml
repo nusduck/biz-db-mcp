@@ -1,0 +1,94 @@
+# biz-db-mcp configuration. Copy to config.yaml (git-ignored) and edit.
+# Loaded once at startup; restart to apply changes. Path: --config, then
+# $BIZDB_CONFIG, then ./config.yaml. Unknown keys are rejected.
+#
+# This file never holds secrets: the bearer token is read from the variable
+# named by server.auth_token_env, and database passwords come from DBPM.
+
+server:
+  transport: streamable-http      # stdio for local development
+  host: 0.0.0.0
+  port: 8080                      # endpoint path is /mcp
+  auth_token_env: BIZDB_MCP_TOKEN # platform authTokenRef uses the same name
+  allowed_hosts: []               # Host header allowlist, e.g. ["bizdb-mcp.internal.example"]
+  max_request_bytes: 16777216     # 16 MiB: a 10 MiB import as base64 plus JSON
+  tool_deadline_seconds: 150      # must stay below the platform timeoutMs (180 s)
+
+limits:                           # per process; with N replicas the total is N x these
+  query:  {max_rows: 200, max_bytes: 1048576, timeout_seconds: 10}
+  export: {max_rows: 100000, max_bytes: 20971520, timeout_seconds: 120, row_batch_size: 20000}
+  import: {max_bytes: 10485760, max_rows: 50000, max_columns: 256, max_field_bytes: 65536, timeout_seconds: 120}
+  concurrency: {total: 4, per_institution: 2, export: 1, import: 1}
+  rate: {per_minute: 60, burst: 10}   # per normalized institution code
+
+# Relative paths below resolve against this file's directory.
+logging:
+  level: WARNING                  # service/SDK logs; audit records are always written
+  stderr: true                    # also write both streams to stderr (container logs)
+  audit:                          # one JSON line per tool call, no SQL/params/data
+    path: /var/log/biz-db-mcp/audit.log
+    max_bytes: 10485760           # rotate at 10 MiB
+    backup_count: 5               # keep 5 old files -> at most 60 MiB on disk
+  app:
+    path: /var/log/biz-db-mcp/server.log
+    max_bytes: 10485760
+    backup_count: 3               # at most 40 MiB
+
+storage:
+  temp_dir: /var/lib/biz-db-mcp/tmp   # export staging; omit for the system temp dir
+  stale_temp_seconds: 3600            # leftovers from a crash are removed at startup
+
+dbpm:
+  enabled: true
+  servers: ["172.21.72.32:7000", "172.21.72.33:7000"]
+  connect_timeout_ms: 3000
+  endpoint_timeout_ms: 5000
+  budget_ms: 10000
+
+databases:
+  primary:
+    default: true
+    dsn: mysql://app_reader@db-host:3306/app   # never include a password
+    dbpm_database: app                         # DBPM entry name (defaults to the DSN database)
+    dbpm_user: app_reader                      # defaults to the DSN user
+    allow_reads: true
+    allow_imports: false
+    # Separate least-privilege account used only by import_rows.
+    # import_credential:
+    #   dsn: mysql://app_importer@db-host:3306/app
+    #   dbpm_database: app
+    #   dbpm_user: app_importer
+    # ledger_table: bizdb_import_ledger        # created by migrations/001_import_ledger.sql
+
+reads:
+  enabled: true
+
+# Institution codes are the normalized form (length prefix removed) and must
+# be quoted so YAML keeps leading zeros. Unknown institutions are refused.
+institutions:
+  "00001000": {scope: all}
+  "00002000": {scope: self, allow_imports: true}
+  "00003000": {scope: institutions, ids: ["00003000", "00003001"]}
+
+isolation:
+  # A non-public table is filtered by the first of these columns that exists.
+  column_candidates: [ins_id_cd, instituteid]
+  public_tables: []               # e.g. ["primary:app.dict_region"]
+  tables: {}                      # e.g. {"primary:app.legacy_orders": {column: org_raw, value_format: raw}}
+
+imports:
+  enabled: false
+  tables: {}
+  # tables:
+  #   "primary:app.report_results":
+  #     modes: [insert, upsert]
+  #     columns: [report_date, branch_code, metric, value]
+  #     key_columns: [report_date, branch_code, metric]
+  #     institution_column: ins_id_cd    # written by the server, never trusted from the file
+  #     value_format: code
+  #     max_rows: 50000
+
+# Generic model-authored DML is a local stdio development aid only and is
+# refused at startup over streamable-http.
+writes:
+  enabled: false

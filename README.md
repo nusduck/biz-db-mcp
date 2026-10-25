@@ -1,123 +1,152 @@
 # biz-db-mcp
 
-一个面向 Agent 的 MySQL MCP Server，支持多数据库、只读查询、受保护的 DML 写入，以及批量导出到 Sandbox Dataset。
+面向 UPRC 智能体平台的 MySQL MCP Server：按调用者机构隔离的只读查询、经 MCP 返回文件的导出，以及白名单内的产物导入。
 
-> v0.2 灵活性升级：按库覆盖配置、WHERE 白名单、`list_tables`/`explain` 勘探、`dry_run` 预检、`execute_many` 批量事务、`offset` 分页与 `csv/jsonl` 导出。
+> v0.3 平台接入：Streamable HTTP + Bearer、宿主参数 `instituteid`、表替换式行级隔离、DBPM 原生 TCP 取密、`config.yaml` 配置、导出改为 embedded resource、新增 `import_rows`。迁移说明见文末。
 
 ## 设计边界
 
-- 默认只读：`BIZDB_WRITE_ENABLED` 默认关闭，单个数据库还必须显式 `allow_writes: true`。
-- `query` 与 `export` 只允许单条 `SELECT`/`WITH ... SELECT`；`execute` 只允许单条 `INSERT`、`UPDATE`、`DELETE` 或 `REPLACE`，`execute_many` 允许单事务批量（最多 100 条）。
-- `UPDATE`/`DELETE` 默认必须带 `WHERE`，可通过 `BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES` 按表名 glob 放宽（如 `temp_*,cache_*`）；写入在事务中执行，并受最大影响行数限制（支持按库覆盖）。
-- `export` 使用服务端游标分批写 Parquet/CSV/JSONL，再上传 Sandbox；身份从进程环境注入，模型不能指定目标 session。
-- SQL 审计只记录 SHA-256 和长度，不记录原始 SQL、参数或密码。
-- 所有限流与超时均支持按库覆盖，全局配置为 fallback。
+- **机构隔离**：所有工具都有顶层必填字符串参数 `instituteid`，由平台按登录用户注入（模型看不到、改不了）。服务端按平台同一规则归一（`0800001000` → `00001000`），未知机构直接拒绝。
+- **行级过滤**：模型写的 SELECT 用 sqlglot 解析，每个基表引用替换为 `(SELECT * FROM 表 WHERE 机构列 IN (...)) AS 别名`，对 JOIN、OR、外连接、聚合、子查询、UNION、CTE 同样成立。非公共表必须有机构列（`isolation.column_candidates` 中第一个存在的列）或显式配置，否则视为不存在。
+- **SQL 准入**：只允许单条 SELECT（含 WITH / UNION）；含任何注释、锁定读、`INTO`、变量、未知/危险函数、系统库的语句一律拒绝。
+- **只读**：读连接使用最小权限读账号并设置 `SESSION TRANSACTION READ ONLY`；行数、序列化字节、执行时间都有上限，截断会标明原因。
+- **导出**：生成 Parquet/CSV/JSONL 后以 MCP embedded resource（base64）返回，平台写入会话工作区。本服务不调用 Sandbox、不持有 Sandbox 凭据。超限整体失败，不截断。
+- **导入**：`import_rows` 默认关闭；只能写运维白名单内的表与列，机构列由服务端写入，单事务、持久幂等账本防重复写入。
+- **通用 DML**：`execute` / `execute_many` 仅供本地 stdio 开发，HTTP 部署下拒绝启动。
+- **审计**：stderr 输出 JSON 行，只含工具、机构码、库/表、SQL 摘要与长度、状态、错误码和耗时；不含 SQL 原文、参数、凭据、文件内容或结果数据。
 
 ## 目录结构
 
 ```text
 biz_db_mcp/
-  config.py          # 环境变量、多数据库、写入和 DBPM 配置（含按库覆盖与文件加载）
-  db.py              # MySQL 连接、查询、写入、勘探（describe/list_tables/explain/批量）
-  dbpm.py            # DBPM 外部桥接命令适配器
-  sql_guard.py       # SELECT/DML 语句边界
-  export.py          # 流式 Parquet/CSV/JSONL 导出
-  sandbox_client.py  # Dataset 上传（多格式 MIME）
-  audit.py           # 结构化审计日志
-  server.py          # MCP 工具注册（8 个工具）
-tests/               # 单元测试
+  config.py        # config.yaml 加载与严格校验
+  institution.py   # 机构号校验与归一
+  policy.py        # 机构范围、表策略
+  sql_guard.py     # SELECT 准入与表替换改写（另含开发用 DML 守卫）
+  db.py            # 连接、元数据、隔离查询、导出流
+  credentials.py   # 启动时一次性取齐数据库口令
+  dbpm.py          # DBPM 原生 TCP 协议客户端
+  export.py        # 固定 schema 的流式文件生成
+  mcp_files.py     # 文件 → embedded resource
+  import_rows.py   # 产物导入：校验、类型检查、事务写入
+  import_ledger.py # 幂等账本
+  limits.py        # 并发槽与机构速率
+  transport.py     # HTTP Bearer 鉴权与请求体上限
+  errors.py        # 稳定错误码
+  audit.py         # 结构化审计日志
+  server.py        # MCP 工具与启动入口
+migrations/        # DBA 执行的账本 DDL 与授权模板
+tests/
 ```
 
 ## 配置
 
-单库兼容配置：`BIZDB_MYSQL_DSN=mysql://user:password@host:3306/database`。
+全部可信配置放在一个 YAML 文件里，启动时加载一次，修改后重启生效。查找顺序：`--config` 参数 → `$BIZDB_CONFIG` → 当前目录 `config.yaml`。复制 [config.example.yaml](config.example.yaml) 为 `config.yaml`（已被 git 忽略）后修改。未知键会直接报错，避免拼写错误被悄悄忽略。
 
-多库使用 `BIZDB_DATABASES_JSON`，格式可以是映射或 `connections` 数组：
+文件里**不放秘密**：
 
-```json
-{"connections":[
-  {"id":"primary","dsn":"mysql://user:password@db-a/app","query_max_rows":200},
-  {"id":"reporting","dsn":"mysql://user:password@db-b/reporting","allow_writes":false,"query_max_rows":5000}
-]}
-```
+| 秘密 | 来源 |
+|---|---|
+| MCP Bearer token | `server.auth_token_env` 指定的环境变量（默认 `BIZDB_MCP_TOKEN`，平台 `authTokenRef` 用同名） |
+| 数据库口令 | DBPM（`dbpm.enabled: true`），启动时取一次，只在内存中 |
+| 本地开发口令 | 仅 stdio 且 DBPM 关闭时，`databases.<id>.password_env` 指定的环境变量 |
 
-也支持文件加载：`BIZDB_DATABASES_FILE=/etc/biz-db.json`（内容与 `BIZDB_DATABASES_JSON` 同格式，优先级：`BIZDB_DATABASES_JSON` > `BIZDB_DATABASES_FILE` > `BIZDB_MYSQL_DSN`）。
+DSN 中带口令会被拒绝。主要配置块：
 
-`BIZDB_DEFAULT_DATABASE` 选择默认库。写入还需要 `BIZDB_WRITE_ENABLED=true`，并在目标库配置 `allow_writes: true`；可用 `BIZDB_WRITE_MAX_AFFECTED_ROWS` 和 `BIZDB_WRITE_REQUIRE_WHERE` 调整保护阈值。按库覆盖示例：
+| 块 | 作用 |
+|---|---|
+| `server` | `transport`（stdio / streamable-http）、`host`、`port`、`auth_token_env`、`allowed_hosts`、`max_request_bytes`、`tool_deadline_seconds` |
+| `limits` | query / export / import 的行数、字节、时间上限；`concurrency` 并发槽；`rate` 每机构速率。均为**每实例**预算 |
+| `dbpm` | 两个 `host:port` 端点与连接/单端点/总预算超时 |
+| `databases` | 连接目录：无口令 DSN、DBPM 条目名、`allow_reads`、`allow_imports`、独立 `import_credential`、按库覆盖的上限 |
+| `institutions` | 归一机构码 → `scope: self / institutions / all`、`ids`、`allow_imports`。**键必须加引号**，否则 YAML 会丢前导零 |
+| `isolation` | `column_candidates`、`public_tables`、按表显式 `tables`（`column`、`value_format: code / raw`） |
+| `imports` | 总开关与白名单表：`modes`、`columns`、`key_columns`、`institution_column`、`max_rows` |
+| `writes` | 仅本地 stdio 的通用 DML 开关 |
+| `logging` | `level`、`stderr`；`audit` / `app` 两个文件各自的 `path`、`max_bytes`、`backup_count`（按大小轮转，`backup_count ≥ 1`） |
+| `storage` | `temp_dir` 导出暂存目录、`stale_temp_seconds` 启动时清理残留的阈值 |
 
-```json
-{"id":"writer","dsn":"mysql://...","allow_writes":true,"write_max_affected_rows":5000,"write_require_where":false,"query_timeout_seconds":30}
-```
+文件中的相对路径都相对配置文件所在目录解析。
 
-支持的按库覆盖字段：`query_max_rows`、`query_timeout_seconds`、`export_max_rows`、`export_timeout_seconds`、`write_max_affected_rows`、`write_require_where`（`null` 表示继承全局）。
+### 存储占用
 
-WHERE 白名单：`BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES=temp_*,cache_logs`（逗号或空格分隔，glob 匹配，大小写不敏感），命中白名单的表允许 `UPDATE/DELETE` 不带 `WHERE`。
-
-### 工具一览（8 个）
-
-| 工具 | 说明 | 灵活性增强 |
+| 位置 | 内容 | 上限 |
 |---|---|---|
-| `list_databases` | 列出已配置库，不暴露 DSN | 按库覆盖后仍脱敏返回 |
-| `describe_table` | 返回表结构，支持 `schema.table` | 支持 `db.table` 限定 |
-| `list_tables` | 列出库内表/视图，支持 `pattern`（LIKE）过滤 | 新增 |
-| `query` | 受控只读 SELECT，`limit` 受按库上限约束 | 新增 `offset` 分页、`dry_run` 预检 |
-| `explain` | 返回 `EXPLAIN` 执行计划，不实际执行 | 新增 |
-| `execute` | 单条 DML 事务提交 | 新增 `dry_run`（EXPLAIN/ROLLBACK 预估） |
-| `execute_many` | 多条 DML 单事务批量（≤100 条） | 新增，`atomic` 控制是否全回滚 |
-| `export` | 流式导出到 Sandbox Dataset | 新增 `format: parquet/csv/jsonl` |
+| `logging.audit.path` | 审计 JSON 行 | `(backup_count + 1) × max_bytes`，默认 60 MiB |
+| `logging.app.path` | 服务/SDK 日志 | 同上，示例 40 MiB；不配置路径则只写 stderr |
+| `storage.temp_dir` | 导出文件生成到返回之间的暂存，返回后立即删除 | 同时导出数（`limits.concurrency.export`，默认 1）× `limits.export.max_bytes`（20 MiB）；崩溃残留在下次启动时清理 |
+| 进程内存 | 导出 base64（约 1.33 × 文件）、导入解码字节与解析后的行、查询结果 | 导出约 27 MiB + JSON；导入 10 MiB 文件及最多 5 万行；查询 1 MiB |
+| MySQL 账本表 `bizdb_import_ledger` | 每次成功导入一行（约 300 B） | 不自动清理；服务账号无 DELETE 权限，按需由 DBA 定期清理很久以前的记录（清理后同一文件可再次导入） |
 
-`execute` 仍为单语句 DML 接口，不提供 DDL、事务控制或多语句拼接；批量场景请用 `execute_many`。
+服务本身不写其他文件：DBPM 口令只在内存，MCP 无状态模式不存会话，速率桶按已配置的机构数有界。
 
-## DBPM（可选）
+## 工具
 
-UPspec 中的 DBPM 是密码管理系统，不是 MCP 请求认证。Python 项目不内置私有 Java SDK；启用 `BIZDB_DBPM_ENABLED=true` 后，必须配置 `BIZDB_DBPM_COMMAND`、`BIZDB_DBPM_SERVERS`、`BIZDB_DBPM_APP_NAME`、`BIZDB_DBPM_APP_KEY` 和 `BIZDB_DBPM_APP_IP`。
+| 工具 | 说明 |
+|---|---|
+| `list_databases` | 本机构可读的库 |
+| `list_tables` | 本机构可读的表/视图，`pattern` 为 LIKE |
+| `describe_table` | 列元数据 |
+| `query` | 隔离后的只读 SELECT；`limit`/`offset` 分页，`dry_run` 只做校验与授权解析 |
+| `explain` | 隔离后 SELECT 的执行计划 |
+| `export` | 结果文件以 embedded resource 返回；超限报 `TOO_LARGE` |
+| `import_rows` | `imports.enabled` 时注册；白名单产物导入，`dry_run` 默认 true |
+| `execute` / `execute_many` | 仅本地 stdio 且 `writes.enabled` 时注册 |
 
-桥接命令从 stdin 读取 JSON（包含 database、username、servers 等字段），只在 stdout 输出密码，非零退出码表示失败。DBPM 私钥通过 `DBPM_APP_KEY` 环境变量传给桥接进程，不出现在命令行参数中。数据库条目可用 `dbpm_database`/`dbpm_user` 覆盖 DBPM 查询键。
+错误统一为 `isError` 结果，文本以稳定错误码开头，如 `FORBIDDEN_INSTITUTION`、`RESOURCE_NOT_ACCESSIBLE`、`SQL_REJECTED`、`TABLE_NOT_IMPORTABLE`、`CONTENT_DIGEST_MISMATCH`、`TOO_LARGE`、`RATE_LIMITED`、`BUSY`、`DEADLINE_EXCEEDED`、`IMPORT_OUTCOME_UNKNOWN`。跨机构拒绝与“不存在”返回同一错误。
 
-## 开发与运行
+## 部署
 
 ```bash
 python3 -m pip install -e '.[dev]'
 python3 -m pytest
-biz-db-mcp
+export BIZDB_MCP_TOKEN=...            # 只有平台持有
+biz-db-mcp --config /etc/biz-db-mcp/config.yaml --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 
-Sandbox 上传仍需配置 `BIZDB_SANDBOX_BASE_URL`、`BIZDB_SANDBOX_API_TOKEN`；导出身份需配置 `BIZDB_SESSION_ID`、`BIZDB_ORG_ID`、`BIZDB_USER_ID`。生产环境应使用 DBPM，不要把真实密码提交到配置、日志或测试夹具中。
+端点为 `http://<host>:<port>/mcp`，无状态模式，便于多副本。容器以非 root 用户运行，经内网或 TLS 反向代理暴露。反向代理/网关的请求体上限至少为 `server.max_request_bytes`，响应上限需容纳 20 MiB 文件的 base64（约 27 MiB）加 JSON。服务端端到端期限（默认 150 秒）须低于平台 `timeoutMs`（示例 180 秒）。
 
-### 灵活性使用示例
+平台清单示例：
 
-```python
-# 分页查询
-query("SELECT id, name FROM users WHERE active=1", limit=50, offset=100)
-
-# 预检（不查库）
-query("SELECT * FROM orders WHERE status=%s", ["paid"], dry_run=True)
-# -> {"dry_run": True, "effective_limit": 200, "effective_timeout": 10}
-
-explain("SELECT * FROM orders WHERE status=%s", ["paid"])
-list_tables(pattern="order%", include_views=False)
-describe_table("reporting.orders")
-
-# 写入预估
-
-execute("UPDATE users SET active=0 WHERE id=%s", [123], dry_run=True)
-# -> {"dry_run": True, "estimated_plan": [...] }
-
-# 批量事务
-execute_many([
-  {"sql": "INSERT INTO users(name) VALUES (%s)", "params": ["alice"]},
-  {"sql": "UPDATE users SET active=1 WHERE id=%s", "params": [123]}
-], atomic=True)
-
-# 多格式导出
-export("SELECT * FROM orders", dataset_name="orders_2024", format="csv")
-export("SELECT * FROM orders", dataset_name="orders_2024", format="jsonl")
+```json
+{
+  "id": "bizdb",
+  "url": "https://bizdb-mcp.internal.example/mcp",
+  "authTokenRef": "BIZDB_MCP_TOKEN",
+  "timeoutMs": 180000,
+  "hostArguments": {"instituteid": {"description": "调用者机构号", "source": "user.instituteId"}},
+  "artifactArguments": {
+    "file_base64": {
+      "description": "已提交的待导入数据产物",
+      "modelArgument": "artifact_id",
+      "filenameArgument": "filename",
+      "sha256Argument": "content_sha256",
+      "maxBytes": 10485760,
+      "mimeTypes": ["text/csv", "application/x-ndjson", "application/vnd.apache.parquet"]
+    }
+  },
+  "fileResults": {"maxBytes": 20971520}
+}
 ```
 
-### 环境变量速查（新增标记 ★）
+启用导入前：DBA 执行 [migrations/001_import_ledger.sql](migrations/001_import_ledger.sql)，按其中模板给独立导入账号授权；核对目标表唯一约束含机构列。启动时会检查账本表，缺失则拒绝启动。
 
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| `BIZDB_DATABASES_FILE` ★ | 多库 JSON 文件路径 | - |
-| `BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES` ★ | 免 WHERE 白名单（glob） | - |
-| 单库按库覆盖 ★ | `query_max_rows` 等 6 个字段可在 `BIZDB_DATABASES_JSON` 单库内覆盖 | 继承全局 |
+本地开发（stdio，DBPM 关闭）：
+
+```yaml
+server: {transport: stdio}
+dbpm: {enabled: false}
+databases:
+  primary: {dsn: "mysql://dev@127.0.0.1:3306/app", password_env: BIZDB_DEV_PASSWORD}
+institutions:
+  "00002000": {scope: self}
+```
+
+## 迁移说明（v0.2 → v0.3）
+
+- 配置从环境变量改为 `config.yaml`。`BIZDB_MYSQL_DSN`、`BIZDB_DATABASES_JSON`、`BIZDB_DBPM_*`、`BIZDB_SANDBOX_*`、`BIZDB_SESSION_ID`/`ORG_ID`/`USER_ID`/`CONVERSATION_ID` 等旧变量仍被设置时拒绝启动，并列出变量名。
+- 所有工具新增必填 `instituteid`；平台清单需同步配置 `hostArguments`。
+- `export` 不再上传 Sandbox，也不再返回 `dataset_id`；改为返回文本摘要 + embedded resource。
+- `query` 返回 `{rows, row_count, truncated, truncated_reason, ...}`；`dry_run` 不再回显 SQL 与参数。
+- DBPM 从外部桥接命令改为原生 TCP 协议；`BIZDB_DBPM_COMMAND`/`APP_NAME`/`APP_KEY`/`APP_IP` 不再使用。
+- `execute` / `execute_many` 只在本地 stdio 开发可用。

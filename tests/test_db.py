@@ -3,29 +3,19 @@ from contextlib import contextmanager
 import pytest
 
 from biz_db_mcp import db
-from biz_db_mcp.config import load_settings
+from conftest import make_settings
 from biz_db_mcp.db import QueryError, _parse_dsn, execute_write
 
 
-def _base_env(monkeypatch):
-    monkeypatch.setenv("BIZDB_MYSQL_DSN", "mysql://user:password@localhost:3306/app")
-    monkeypatch.setenv("BIZDB_SANDBOX_BASE_URL", "http://sandbox:8000")
-    monkeypatch.setenv("BIZDB_SANDBOX_API_TOKEN", "token")
-
-
 def test_dbpm_can_supply_password_for_a_passwordless_dsn():
-    parsed = _parse_dsn(
-        "mysql://user@localhost:3306/app",
-        password_override="resolved-password",
-    )
+    parsed = _parse_dsn("mysql://user@localhost:3306/app", password="resolved-password")
 
     assert parsed["user"] == "user"
     assert parsed["password"] == "resolved-password"
 
 
 def test_write_is_disabled_by_default(monkeypatch):
-    _base_env(monkeypatch)
-    settings = load_settings()
+    settings = make_settings()
 
     with pytest.raises(QueryError, match="disabled"):
         execute_write(settings, "UPDATE users SET active = 0 WHERE id = 1", [])
@@ -73,12 +63,10 @@ class _Connection:
 
 
 def _writer_settings(monkeypatch, max_rows="1000"):
-    _base_env(monkeypatch)
-    monkeypatch.setenv("BIZDB_DATABASES_JSON", '{"writer": {"dsn": "mysql://u:p@db/app", "allow_writes": true}}')
-    monkeypatch.setenv("BIZDB_DEFAULT_DATABASE", "writer")
-    monkeypatch.setenv("BIZDB_WRITE_ENABLED", "true")
-    monkeypatch.setenv("BIZDB_WRITE_MAX_AFFECTED_ROWS", max_rows)
-    return load_settings()
+    return make_settings({
+        "databases": {"primary": {"allow_writes": True}},
+        "writes": {"enabled": True, "max_affected_rows": int(max_rows)},
+    })
 
 
 def test_write_commits_one_guarded_statement(monkeypatch):

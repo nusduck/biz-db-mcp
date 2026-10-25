@@ -5,27 +5,19 @@ from contextlib import contextmanager
 import pytest
 
 from biz_db_mcp import db
-from biz_db_mcp.config import load_settings
+from conftest import make_settings
 from biz_db_mcp.db import QueryError
 
 
-def _base_env(monkeypatch):
-    monkeypatch.setenv("BIZDB_MYSQL_DSN", "mysql://user:password@localhost:3306/app")
-    monkeypatch.setenv("BIZDB_SANDBOX_BASE_URL", "http://sandbox:8000")
-    monkeypatch.setenv("BIZDB_SANDBOX_API_TOKEN", "token")
-
-
 def _writer_settings(monkeypatch, max_rows="1000", except_tables=""):
-    _base_env(monkeypatch)
-    monkeypatch.setenv("BIZDB_DATABASES_JSON", '{"writer": {"dsn": "mysql://u:p@db/app", "allow_writes": true}}')
-    monkeypatch.setenv("BIZDB_DEFAULT_DATABASE", "writer")
-    monkeypatch.setenv("BIZDB_WRITE_ENABLED", "true")
-    monkeypatch.setenv("BIZDB_WRITE_MAX_AFFECTED_ROWS", max_rows)
-    if except_tables:
-        monkeypatch.setenv("BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES", except_tables)
-    else:
-        monkeypatch.delenv("BIZDB_WRITE_REQUIRE_WHERE_EXCEPT_TABLES", raising=False)
-    return load_settings()
+    return make_settings({
+        "databases": {"primary": {"allow_writes": True}},
+        "writes": {
+            "enabled": True,
+            "max_affected_rows": int(max_rows),
+            "require_where_except_tables": [t for t in except_tables.split(",") if t],
+        },
+    })
 
 
 class _Cursor:
@@ -238,14 +230,20 @@ def test_execute_dry_run_does_not_execute_dml_when_explain_fails(monkeypatch):
     assert executed[0].startswith("EXPLAIN")
 
 
-# ---- P2: offset validation before dry_run ----
+# ---- P2: offset validation before any database access ----
 
 def test_query_offset_validation_before_dry_run(monkeypatch):
-    _base_env(monkeypatch)
-    settings = load_settings()
+    from biz_db_mcp.errors import BizDbError
+    from biz_db_mcp.institution import parse_institution
+    from biz_db_mcp.policy import AccessPolicy
 
-    with pytest.raises(QueryError, match="offset"):
-        db.run_query(settings, "SELECT 1", None, limit=10, offset=-7, dry_run=True)
+    settings = make_settings()
+    policy = AccessPolicy(settings, parse_institution("00002000"))
 
-    with pytest.raises(QueryError, match="offset"):
-        db.run_query(settings, "SELECT 1", None, limit=10, offset=-1, dry_run=False)
+    def no_connection(*a, **kw):
+        raise AssertionError("must not connect")
+
+    monkeypatch.setattr(db, "_connection", no_connection)
+    for bad in (-7, -1, db.MAX_OFFSET + 1):
+        with pytest.raises(BizDbError, match="offset"):
+            db.run_query(settings, policy, "SELECT 1", None, limit=10, offset=bad, dry_run=True)

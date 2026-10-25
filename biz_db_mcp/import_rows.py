@@ -41,6 +41,7 @@ import json
 import math
 import re
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -165,6 +166,9 @@ _INTEGER_RANGES: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
 }
 
 _STRING_TYPES = frozenset({"char", "varchar", "tinytext", "text", "mediumtext", "longtext"})
+# String types whose key equality follows the column collation. Enum/set are
+# compared by their stored string, so they are included here.
+_COLLATION_TYPES = _STRING_TYPES | {"enum", "set"}
 _DATETIME_TYPES = frozenset({"datetime", "timestamp"})
 _UNSUPPORTED_TYPES = frozenset(
     {
@@ -216,6 +220,7 @@ class ColumnMetadata:
     character_maximum_length: int | None
     numeric_precision: int | None
     numeric_scale: int | None
+    collation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -835,7 +840,7 @@ def _load_table_metadata(cursor: Any, *, schema: str, table: str) -> TableMetada
     cursor.execute(
         "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, "
         "COLUMN_DEFAULT, EXTRA, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, "
-        "NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS "
+        "NUMERIC_SCALE, COLLATION_NAME FROM INFORMATION_SCHEMA.COLUMNS "
         "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
         (schema, table),
     )
@@ -886,6 +891,7 @@ def _column_metadata(row: Any) -> ColumnMetadata:
         character_maximum_length=_as_int(_field(row, "CHARACTER_MAXIMUM_LENGTH")),
         numeric_precision=_as_int(_field(row, "NUMERIC_PRECISION")),
         numeric_scale=_as_int(_field(row, "NUMERIC_SCALE")),
+        collation=_as_text(_field(row, "COLLATION_NAME")),
     )
 
 
@@ -1075,6 +1081,7 @@ def _validate_rows(
     file_index_by_target = {
         column.name.lower(): index for index, column in mapped.bindings
     }
+    column_by_file_index = {index: column for index, column in mapped.bindings}
     key_indexes: list[int] = []
     keys_complete = True
     for key in spec.key_columns:
@@ -1095,12 +1102,19 @@ def _validate_rows(
                 sink.add(row_number, column.name, reason)
 
         if mode == "upsert" and keys_complete:
-            key = tuple(values[index] for index in key_indexes)
+            # MySQL compares string key columns through the column collation,
+            # so the in-file dedupe must be at least as coarse as that equality;
+            # otherwise a later row would silently update the earlier row and
+            # the inserted/updated counts would be wrong.
+            key = tuple(
+                _comparison_key(values[index], column_by_file_index[index])
+                for index in key_indexes
+            )
             if key in seen_keys:
                 sink.add(
                     row_number,
                     ",".join(spec.key_columns),
-                    "duplicate key tuple in the file",
+                    "duplicate key tuple in the file (by the column collation)",
                 )
             else:
                 seen_keys.add(key)
@@ -1112,6 +1126,41 @@ def _validate_rows(
             )
         rows.append(output)
     return rows
+
+
+def _comparison_key(value: Any, column: ColumnMetadata) -> Any:
+    """Return a dedupe key at least as coarse as MySQL collation equality.
+
+    MySQL compares string key columns with the column collation, which is
+    usually case-insensitive and often accent- and trailing-space-insensitive.
+    The key only needs to be coarser than MySQL, never finer: a false duplicate
+    is a validation problem, while a missed duplicate would silently overwrite
+    an earlier row and make the inserted/updated counts wrong.
+    """
+    collation = column.collation
+    if (
+        not isinstance(value, str)
+        or column.data_type not in _COLLATION_TYPES
+        or collation is None
+    ):
+        return value
+    name = collation.lower()
+    if name == "binary" or name.endswith("_bin"):
+        return value
+    # PAD SPACE: trailing spaces never distinguish key values. Applying this to
+    # NO PAD collations too only makes the key coarser, which is acceptable.
+    text = value.rstrip(" ")
+    if "_ci" in name:
+        text = text.casefold()
+    if "_ai" in name or ("_as" not in name and "_cs" not in name):
+        # Legacy collations (utf8mb4_general_ci, utf8mb4_unicode_ci, ...) have
+        # no explicit accent marker but are accent-insensitive in practice.
+        text = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", text)
+            if not unicodedata.combining(character)
+        )
+    return unicodedata.normalize("NFKC", text).rstrip(" ")
 
 
 def _validate_cell(value: Any, column: ColumnMetadata) -> tuple[Any, str | None]:

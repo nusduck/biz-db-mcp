@@ -224,6 +224,7 @@ def _column(
     char_length: int | None = None,
     precision: int | None = None,
     scale: int | None = None,
+    collation: str | None = None,
 ) -> dict[str, Any]:
     return {
         "COLUMN_NAME": name,
@@ -235,6 +236,7 @@ def _column(
         "CHARACTER_MAXIMUM_LENGTH": char_length,
         "NUMERIC_PRECISION": precision,
         "NUMERIC_SCALE": scale,
+        "COLLATION_NAME": collation,
     }
 
 
@@ -249,6 +251,14 @@ DEFAULT_COLUMNS = (
 )
 DEFAULT_UNIQUE = (("PRIMARY", ("report_date", "branch_code", "ins_id_cd")),)
 _DEFAULT = object()
+
+
+def replace_column(name: str, **fields: Any) -> list[dict[str, Any]]:
+    """Return a copy of :data:`DEFAULT_COLUMNS` with *name* overridden."""
+    return [
+        {**column, **fields} if column["COLUMN_NAME"] == name else dict(column)
+        for column in DEFAULT_COLUMNS
+    ]
 
 
 class Environment:
@@ -940,6 +950,7 @@ def test_metadata_uses_config_identifiers_as_parameters():
     sql, params = column_queries[0]
     assert params == ("app", "report_results")
     assert "report_results" not in sql
+    assert "COLLATION_NAME" in sql
 
 
 def test_metadata_database_errors_are_redacted():
@@ -1278,6 +1289,163 @@ def test_upsert_duplicate_key_in_file_fails_a_real_write():
 
     assert excinfo.value.code == VALIDATION_FAILED
     assert "duplicate key tuple" in excinfo.value.message
+
+
+def _key_rows(first_branch: str, second_branch: str) -> tuple[tuple[Any, ...], ...]:
+    """Two rows with the same date and differing key-column values."""
+    return (
+        ("2026-01-01", first_branch, "sales", "1.25", ""),
+        ("2026-01-01", second_branch, "cost", "2.50", ""),
+    )
+
+
+def test_upsert_key_dedupe_follows_a_case_insensitive_collation():
+    env = Environment(
+        columns=replace_column("branch_code", COLLATION_NAME="utf8mb4_0900_ai_ci")
+    )
+    rows = _key_rows("abc", "ABC")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    duplicates = [
+        problem
+        for problem in result.problems
+        if "duplicate key tuple" in problem.reason
+    ]
+    assert [problem.row for problem in duplicates] == [2]
+    assert "collation" in duplicates[0].reason
+    reasons = " ".join(problem.reason for problem in result.problems).lower()
+    assert "abc" not in reasons
+    assert env.business_inserts == []
+    assert env.ledger_inserts == []
+
+
+def test_case_insensitive_duplicate_key_fails_a_real_write():
+    env = Environment(
+        columns=replace_column("branch_code", COLLATION_NAME="utf8mb4_0900_ai_ci")
+    )
+    rows = _key_rows("abc", "ABC")
+
+    with pytest.raises(BizDbError) as excinfo:
+        run(env, make_request(csv_payload(rows), mode="upsert"))
+
+    assert excinfo.value.code == VALIDATION_FAILED
+    assert "duplicate key tuple" in excinfo.value.message
+    assert "abc" not in str(excinfo.value).lower()
+    assert env.business_inserts == []
+    assert env.ledger_inserts == []
+
+
+def test_upsert_key_dedupe_strips_trailing_spaces():
+    env = Environment(
+        columns=replace_column("branch_code", COLLATION_NAME="utf8mb4_0900_ai_ci")
+    )
+    rows = _key_rows("abc", "abc ")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    duplicates = [
+        problem
+        for problem in result.problems
+        if "duplicate key tuple" in problem.reason
+    ]
+    assert [problem.row for problem in duplicates] == [2]
+    assert "abc" not in " ".join(
+        problem.reason for problem in result.problems
+    ).lower()
+
+
+def test_upsert_key_dedupe_ignores_accents_under_an_ai_collation():
+    env = Environment(
+        columns=replace_column("branch_code", COLLATION_NAME="utf8mb4_0900_ai_ci")
+    )
+    rows = _key_rows("é", "e")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    duplicates = [
+        problem
+        for problem in result.problems
+        if "duplicate key tuple" in problem.reason
+    ]
+    assert [problem.row for problem in duplicates] == [2]
+    assert "é" not in " ".join(problem.reason for problem in result.problems)
+
+
+def test_binary_collation_keeps_case_distinct_keys():
+    columns = replace_column("branch_code", COLLATION_NAME="utf8mb4_bin")
+    rows = _key_rows("abc", "ABC")
+
+    dry_run = run(
+        Environment(columns=columns),
+        make_request(csv_payload(rows), mode="upsert", dry_run=True),
+    )
+
+    assert dry_run.status == "dry_run"
+    assert dry_run.problems == ()
+    assert dry_run.row_count == 2
+
+    env = Environment(columns=columns)
+    result = run(env, make_request(csv_payload(rows), mode="upsert"))
+
+    assert result.status == "imported"
+    assert result.inserted == 2
+    assert result.updated == 0
+    assert len(env.business_inserts) == 1
+
+
+def test_case_sensitive_collation_keeps_case_distinct_keys():
+    env = Environment(
+        columns=replace_column("branch_code", COLLATION_NAME="utf8mb4_0900_as_cs")
+    )
+    rows = _key_rows("abc", "ABC")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    assert result.problems == ()
+    assert result.row_count == 2
+
+
+def test_integer_key_columns_are_not_compared_through_the_collation():
+    columns = replace_column(
+        "branch_code",
+        DATA_TYPE="int",
+        COLUMN_TYPE="int",
+        COLLATION_NAME="utf8mb4_0900_ai_ci",
+    )
+    env = Environment(columns=columns)
+    rows = _key_rows("1", "2")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    assert result.problems == ()
+    assert result.row_count == 2
+
+
+def test_integer_key_columns_compare_the_validated_number():
+    columns = replace_column(
+        "branch_code",
+        DATA_TYPE="int",
+        COLUMN_TYPE="int",
+        COLLATION_NAME="utf8mb4_0900_ai_ci",
+    )
+    env = Environment(columns=columns)
+    rows = _key_rows("1", "01")
+
+    result = run(env, make_request(csv_payload(rows), mode="upsert", dry_run=True))
+
+    assert result.status == "dry_run"
+    duplicates = [
+        problem
+        for problem in result.problems
+        if "duplicate key tuple" in problem.reason
+    ]
+    assert [problem.row for problem in duplicates] == [2]
 
 
 # ---------------------------------------------------------------------------

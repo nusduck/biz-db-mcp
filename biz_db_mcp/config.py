@@ -131,6 +131,35 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class LogFileSettings:
+    """One size-rotated log file; disk use is bounded by (backup_count + 1) x max_bytes."""
+
+    path: str | None = None
+    max_bytes: int = 10 * MIB
+    backup_count: int = 5
+
+    @property
+    def max_disk_bytes(self) -> int:
+        return (self.backup_count + 1) * self.max_bytes if self.path else 0
+
+
+@dataclass(frozen=True)
+class LoggingSettings:
+    level: str = "WARNING"  # service and library logs; audit is always recorded
+    stderr: bool = True
+    audit: LogFileSettings = field(default_factory=LogFileSettings)
+    app: LogFileSettings = field(default_factory=LogFileSettings)
+
+
+@dataclass(frozen=True)
+class StorageSettings:
+    """Local scratch space: export files are staged here until returned."""
+
+    temp_dir: str | None = None  # None = the system temp directory
+    stale_temp_seconds: int = 3600
+
+
+@dataclass(frozen=True)
 class DbpmEndpoint:
     host: str
     port: int
@@ -267,6 +296,8 @@ class Settings:
     imports: ImportSettings = field(default_factory=ImportSettings)
     institutions: dict[str, InstitutionScope] = field(default_factory=dict)
     isolation: IsolationSettings = field(default_factory=IsolationSettings)
+    logging: LoggingSettings = field(default_factory=LoggingSettings)
+    storage: StorageSettings = field(default_factory=StorageSettings)
 
     def database(self, database_id: str | None = None) -> DatabaseConfig:
         selected = (database_id or self.default_database).strip()
@@ -650,6 +681,56 @@ def _parse_databases(raw: Any) -> tuple[tuple[DatabaseConfig, ...], str]:
     return tuple(databases), defaults[0] if defaults else databases[0].id
 
 
+_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+_MIN_LOG_FILE_BYTES = 64 * 1024
+
+
+def _resolve_path(value: str, base_dir: Path) -> str:
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else (base_dir / path).resolve())
+
+
+def _parse_log_file(raw: Any, where: str, base_dir: Path) -> LogFileSettings:
+    raw = _mapping(raw, where, {"path", "max_bytes", "backup_count"})
+    path = _str(raw, "path", where)
+    return LogFileSettings(
+        path=_resolve_path(path, base_dir) if path else None,
+        max_bytes=_req_int(raw, "max_bytes", where, 10 * MIB, minimum=_MIN_LOG_FILE_BYTES),
+        # Python's RotatingFileHandler never rotates with backup_count 0, so
+        # at least one backup is required for the size bound to hold.
+        backup_count=_req_int(raw, "backup_count", where, 5, minimum=1, maximum=100),
+    )
+
+
+def _parse_logging(raw: Any, base_dir: Path) -> LoggingSettings:
+    where = "logging"
+    raw = _mapping(raw, where, {"level", "stderr", "audit", "app"})
+    level = str(raw.get("level", "WARNING")).upper()
+    if level not in _LOG_LEVELS:
+        raise ConfigError(f"{where}.level must be one of {', '.join(sorted(_LOG_LEVELS))}")
+    settings = LoggingSettings(
+        level=level,
+        stderr=_bool(raw, "stderr", where, True),
+        audit=_parse_log_file(raw.get("audit"), f"{where}.audit", base_dir),
+        app=_parse_log_file(raw.get("app"), f"{where}.app", base_dir),
+    )
+    if not settings.stderr and not settings.audit.path:
+        raise ConfigError(f"{where}.audit.path is required when {where}.stderr is false")
+    if settings.audit.path and settings.audit.path == settings.app.path:
+        raise ConfigError(f"{where}.audit.path and {where}.app.path must differ")
+    return settings
+
+
+def _parse_storage(raw: Any, base_dir: Path) -> StorageSettings:
+    where = "storage"
+    raw = _mapping(raw, where, {"temp_dir", "stale_temp_seconds"})
+    temp_dir = _str(raw, "temp_dir", where)
+    return StorageSettings(
+        temp_dir=_resolve_path(temp_dir, base_dir) if temp_dir else None,
+        stale_temp_seconds=_req_int(raw, "stale_temp_seconds", where, 3600, minimum=60),
+    )
+
+
 def _parse_writes(raw: Any) -> WriteSettings:
     where = "writes"
     raw = _mapping(
@@ -825,11 +906,18 @@ _TOP_LEVEL_KEYS = {
     "imports",
     "institutions",
     "isolation",
+    "logging",
+    "storage",
 }
 
 
-def parse_settings(document: Any) -> Settings:
-    """Build validated Settings from an already-parsed YAML document."""
+def parse_settings(document: Any, *, base_dir: Path | None = None) -> Settings:
+    """Build validated Settings from an already-parsed YAML document.
+
+    Relative file paths (logs, temp dir) resolve against *base_dir*, which
+    ``load_settings`` sets to the config file's directory.
+    """
+    base_dir = base_dir or Path.cwd()
     document = _mapping(document, "config", _TOP_LEVEL_KEYS)
     databases, default_database = _parse_databases(document.get("databases"))
     database_ids = {database.id for database in databases}
@@ -845,6 +933,8 @@ def parse_settings(document: Any) -> Settings:
         imports=_parse_imports(document.get("imports"), database_ids),
         institutions=_parse_institutions(document.get("institutions")),
         isolation=_parse_isolation(document.get("isolation"), database_ids),
+        logging=_parse_logging(document.get("logging"), base_dir),
+        storage=_parse_storage(document.get("storage"), base_dir),
     )
     _check_consistency(settings)
     return settings
@@ -912,7 +1002,7 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
         document = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         raise ConfigError(f"config file {resolved} is not valid YAML") from exc
-    return parse_settings(document)
+    return parse_settings(document, base_dir=resolved.resolve().parent)
 
 
 def auth_token(settings: Settings) -> str:

@@ -21,6 +21,23 @@ limits:                           # per process; with N replicas the total is N 
   concurrency: {total: 4, per_institution: 2, export: 1, import: 1}
   rate: {per_minute: 60, burst: 10}   # per normalized institution code
 
+# Relative paths below resolve against this file's directory.
+logging:
+  level: WARNING                  # service/SDK logs; audit records are always written
+  stderr: true                    # also write both streams to stderr (container logs)
+  audit:                          # one JSON line per tool call, no SQL/params/data
+    path: /var/log/biz-db-mcp/audit.log
+    max_bytes: 10485760           # rotate at 10 MiB
+    backup_count: 5               # keep 5 old files -> at most 60 MiB on disk
+  app:
+    path: /var/log/biz-db-mcp/server.log
+    max_bytes: 10485760
+    backup_count: 3               # at most 40 MiB
+
+storage:
+  temp_dir: /var/lib/biz-db-mcp/tmp   # export staging; omit for the system temp dir
+  stale_temp_seconds: 3600            # leftovers from a crash are removed at startup
+
 dbpm:
   enabled: true
   servers: ["172.21.72.32:7000", "172.21.72.33:7000"]

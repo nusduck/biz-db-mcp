@@ -49,6 +49,7 @@ _FILE_EXTENSIONS: dict[str, str] = {
     "jsonl": ".jsonl",
 }
 _KNOWN_EXTENSIONS = (".parquet", ".csv", ".jsonl")
+TEMP_PREFIX = "bizdb-export-"
 _MAX_FILENAME_STEM = 120
 _ALLOWED_PUNCTUATION = "._- "
 _BINARY_CHARSET = 63
@@ -252,6 +253,31 @@ def _validate_export_name(name: str, original: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Staging directory
+# ---------------------------------------------------------------------------
+
+
+def prepare_temp_dir(temp_dir: str | None, *, stale_seconds: int) -> int:
+    """Create the staging directory and delete stale export files; return count removed.
+
+    Files are normally removed as soon as the tool result is built; leftovers
+    only exist after a crash or kill. Only this service's own prefix is touched.
+    """
+    directory = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir())
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cutoff = time.time() - stale_seconds
+    removed = 0
+    for path in directory.glob(f"{TEMP_PREFIX}*"):
+        try:
+            if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
 
@@ -266,6 +292,7 @@ def write_export(
     max_bytes: int,
     batch_size: int,
     deadline: float,
+    temp_dir: str | None = None,
 ) -> ExportFile:
     """Stream *rows* into a fresh temporary file and return its metadata.
 
@@ -284,7 +311,9 @@ def write_export(
     )
     _reject_duplicate_columns(columns)
 
-    fd, raw_path = tempfile.mkstemp(prefix="bizdb-export-", suffix=_FILE_EXTENSIONS[fmt])
+    fd, raw_path = tempfile.mkstemp(
+        prefix=TEMP_PREFIX, suffix=_FILE_EXTENSIONS[fmt], dir=temp_dir
+    )
     os.close(fd)
     path = Path(raw_path)
     try:

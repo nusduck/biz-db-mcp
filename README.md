@@ -63,6 +63,22 @@ DSN 中带口令会被拒绝。主要配置块：
 | `isolation` | `column_candidates`、`public_tables`、按表显式 `tables`（`column`、`value_format: code / raw`） |
 | `imports` | 总开关与白名单表：`modes`、`columns`、`key_columns`、`institution_column`、`max_rows` |
 | `writes` | 仅本地 stdio 的通用 DML 开关 |
+| `logging` | `level`、`stderr`；`audit` / `app` 两个文件各自的 `path`、`max_bytes`、`backup_count`（按大小轮转，`backup_count ≥ 1`） |
+| `storage` | `temp_dir` 导出暂存目录、`stale_temp_seconds` 启动时清理残留的阈值 |
+
+文件中的相对路径都相对配置文件所在目录解析。
+
+### 存储占用
+
+| 位置 | 内容 | 上限 |
+|---|---|---|
+| `logging.audit.path` | 审计 JSON 行 | `(backup_count + 1) × max_bytes`，默认 60 MiB |
+| `logging.app.path` | 服务/SDK 日志 | 同上，示例 40 MiB；不配置路径则只写 stderr |
+| `storage.temp_dir` | 导出文件生成到返回之间的暂存，返回后立即删除 | 同时导出数（`limits.concurrency.export`，默认 1）× `limits.export.max_bytes`（20 MiB）；崩溃残留在下次启动时清理 |
+| 进程内存 | 导出 base64（约 1.33 × 文件）、导入解码字节与解析后的行、查询结果 | 导出约 27 MiB + JSON；导入 10 MiB 文件及最多 5 万行；查询 1 MiB |
+| MySQL 账本表 `bizdb_import_ledger` | 每次成功导入一行（约 300 B） | 不自动清理；服务账号无 DELETE 权限，按需由 DBA 定期清理很久以前的记录（清理后同一文件可再次导入） |
+
+服务本身不写其他文件：DBPM 口令只在内存，MCP 无状态模式不存会话，速率桶按已配置的机构数有界。
 
 ## 工具
 

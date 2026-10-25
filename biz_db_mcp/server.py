@@ -13,6 +13,8 @@ import base64
 import datetime as dt
 import decimal
 import json
+import logging
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -34,11 +36,12 @@ from .errors import (
     INVALID_ARGUMENT,
     BizDbError,
 )
-from .export import export_filename, write_export
+from .export import export_filename, prepare_temp_dir, write_export
 from .import_ledger import check_ledger
 from .import_rows import ImportRequest, run_import
 from .institution import Institution, parse_institution
 from .limits import CallGate
+from .logs import configure_logging
 from .mcp_files import export_content
 from .policy import AccessPolicy
 
@@ -299,6 +302,7 @@ def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
                     max_bytes=settings.limits.export.max_bytes,
                     batch_size=settings.limits.export.row_batch_size,
                     deadline=export_deadline,
+                    temp_dir=settings.storage.temp_dir,
                 )
             return export_content(exported, database=selected.id)
 
@@ -457,8 +461,16 @@ def _with_cli_overrides(settings: Settings, args: argparse.Namespace) -> Setting
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+    # Files this service creates (logs, staged exports) are not world-readable.
+    os.umask(0o027)
     try:
         settings = _with_cli_overrides(load_settings(args.config), args)
+        configure_logging(settings.logging)
+        stale = prepare_temp_dir(
+            settings.storage.temp_dir, stale_seconds=settings.storage.stale_temp_seconds
+        )
+        if stale:
+            logging.getLogger(__name__).warning("removed %d stale export files", stale)
         token = auth_token(settings) if settings.server.transport == "streamable-http" else None
         db.configure(CredentialStore.resolve(settings))
         _check_import_ledgers(settings)
@@ -481,7 +493,8 @@ def main(argv: list[str] | None = None) -> None:
         app,
         host=settings.server.host,
         port=settings.server.port,
-        log_level="warning",
+        log_level=settings.logging.level.lower(),
+        log_config=None,  # keep the handlers installed by configure_logging
         access_log=False,
     )
 

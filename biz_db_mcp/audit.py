@@ -1,8 +1,10 @@
 """Structured per-call audit logging without SQL, parameters, credentials, or data.
 
-Records go to stderr as one JSON object per line; stdout is reserved for the
-stdio MCP protocol. SQL is reduced to its SHA-256 and length; callers must not
-pass parameters, file contents, or result rows as fields.
+Records go to the ``biz_db_mcp.audit`` logger as one JSON object per line;
+``logs.configure_logging`` routes it to a size-rotated file and/or stderr.
+stdout is reserved for the stdio MCP protocol. SQL is reduced to its SHA-256
+and length; callers must not pass parameters, file contents, or result rows
+as fields.
 """
 
 from __future__ import annotations
@@ -10,12 +12,12 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import sys
 import time
 import uuid
 from collections.abc import Iterator
 
 from .errors import BizDbError
+from .logs import audit_logger
 
 
 @contextlib.contextmanager
@@ -40,7 +42,7 @@ def log_call(tool: str, **fields: object) -> Iterator[dict[str, object]]:
         raise
     finally:
         record["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
-        print(json.dumps(record, default=str), file=sys.stderr, flush=True)
+        audit_logger().info(json.dumps(record, default=str))
 
 
 def _redact(fields: dict[str, object]) -> dict[str, object]:

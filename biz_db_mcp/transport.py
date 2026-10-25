@@ -18,7 +18,9 @@ class RequestTooLarge(Exception):
     """Raised inside the ASGI receive wrapper when the body exceeds the bound."""
 
 
-async def _respond(send: Send, status: int, code: str, headers: list[tuple[bytes, bytes]] = ()) -> None:
+async def _respond(
+    send: Send, status: int, code: str, headers: tuple[tuple[bytes, bytes], ...] = ()
+) -> None:
     body = json.dumps({"error": code}).encode()
     await send(
         {
@@ -50,7 +52,7 @@ class BearerAuthMiddleware:
             await self._app(scope, receive, send)
             return
         if not self._authorized(scope):
-            await _respond(send, 401, "UNAUTHORIZED", [(b"www-authenticate", b"Bearer")])
+            await _respond(send, 401, "UNAUTHORIZED", ((b"www-authenticate", b"Bearer"),))
             return
         declared = _content_length(scope)
         if declared is not None and declared > self._max_request_bytes:

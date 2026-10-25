@@ -329,3 +329,24 @@ URI 用于标识/文件名，不表示模型需要调用 `resources/read` 下载
 验证层次：先本地单元与真实 loopback HTTP/TCP 测试，再一次性 MySQL 的事务/权限/并发验证，最后平台真实用户的端到端工具调用与产物/文件回读。不得对生产数据库、真实 DBPM 或生产 Sandbox 做未授权测试；部署连通性使用获授权的测试条目与会话。此次计划修订只核对文档和源码，未执行上述集成验证；此前 26 项单测通过不是新方案验收结论。
 
 需联调/业务确认的剩余项：真实 UAuth 值及 raw 存储表映射、实际目标 DBPM 协议、导入表 schema/复合唯一约束与账号、平台实际部署是否已启用文件交换、解析内存预算。跨机构导入与大文件下载均默认不开放；不因缺少确认而降级放行。
+
+## 13. 实施前复核修订（2026-10-25）
+
+开工前对照源码与平台规范复核本计划，发现以下问题并按此实施；与前文冲突处以本节为准。
+
+| # | 问题 | 修订 |
+|---|---|---|
+| 1 | FastMCP 对同步工具直接在事件循环里调用（`func_metadata.call_fn_with_arg_validation` 中 `fn(**args)`），HTTP 多用户下一条慢查询会阻塞全部请求，§8 的并发预算形同虚设 | 所有工具改为 async，阻塞体经 `anyio.to_thread` 执行；准入（并发槽、速率）在线程内持有，直到线程真正结束才释放；端到端期限用 `anyio.fail_after`，超时返回 `DEADLINE_EXCEEDED`（导入返回 `IMPORT_OUTCOME_UNKNOWN`） |
+| 2 | §4.3 只说“AST 改写并在 WHERE 追加条件”，OR、外连接、聚合语义都要逐类处理，易错 | 改为**表替换**：每个真实基表引用 `T AS a` 替换为 `(SELECT * FROM schema.T WHERE col IN (...)) AS a`，过滤先于任何使用发生，OR/外连接/聚合/子查询/UNION/CTE 无需特判；用 sqlglot `traverse_scope` 识别基表与 CTE，未分类的表节点一律拒绝 |
+| 3 | sqlglot 把 MySQL 可执行注释 `/*! ... */` 和优化器提示 `/*+ ... */` 当普通注释，原 regex 守卫同样漏掉 | SQL 中出现**任何注释**即拒绝 |
+| 4 | sqlglot 不能解析 pymysql 的 `%s`；且 pymysql 传参时对整条 SQL 做 `%` 格式化，`LIKE 'a%'` 会出错（现有代码已有此缺陷） | 解析前把字面量外的 `%s` 转为占位符，生成后按 token 位置还原为 `%s`、其余 `%` 转义为 `%%`，并按占位符出现顺序重排参数（过滤值插在 SQL 中间） |
+| 5 | 读取 `query` 依赖客户端早停，`SSCursor.close()` 会读完剩余结果集 | 在 SQL 层加 `LIMIT`（limit+1，用于判定截断），由 MySQL 停止产出；字节上限在序列化时执行 |
+| 6 | §7.3 upsert 只要求“业务键包含机构列”，但表上**任何**不含机构列的唯一索引都可能让 `ON DUPLICATE KEY UPDATE` 命中他机构行 | 要求表上每个 UNIQUE/PK 都含机构列，且 `key_columns + 机构列` 恰好等于某个唯一索引；否则该表拒绝 upsert。插入/更新行数用同事务内 `SELECT ... FOR UPDATE` 统计已存在键，不从 affected_rows 推算 |
+| 7 | 保留注册的 `execute` / `execute_many` 带 `instituteid` 但不做机构隔离，平台若误授权即越权写 | 通用 DML 仅限本地 stdio 开发：`writes.enabled` 在 streamable-http 下拒绝启动，且只有开启时才注册这两个工具 |
+| 8 | FastMCP 在 host 为 127.0.0.1（默认）时自动开启 DNS rebinding 防护、仅放行 localhost，经反向代理/网关部署会被 421 拒绝 | 配置 `server.allowed_hosts`；未配置时关闭 Host 校验，以 Bearer 为边界 |
+| 9 | 用户要求配置对人友好：十余个 `BIZDB_*` 环境变量与 JSON 字符串难以维护 | 改为单一 `config.yaml`（`--config` / `$BIZDB_CONFIG` / `./config.yaml`），严格拒绝未知键；文件内不放秘密：Bearer 由 `server.auth_token_env` 指定的环境变量提供，数据库口令只来自 DBPM；`password_env` 仅限 DBPM 关闭的本地 stdio。检测到旧环境变量时拒绝启动并列出变量名（不回显值） |
+| 10 | YAML 会把未加引号的 `00001000` 解析成整数并丢前导零 | 机构码键必须是字符串；带长度位的原值写进配置直接拒绝 |
+| 11 | 读账号可能能访问同实例其他 schema | 只允许 DSN 所在 schema；其他 schema 的表必须在 `isolation.tables` 显式配置 |
+| 12 | 驱动异常文本可能含列值/SQL 片段 | 对外只返回稳定错误码 + MySQL 错误号与固定提示；1146/1142 等映射为与跨机构一致的 `RESOURCE_NOT_ACCESSIBLE` |
+
+本轮实施范围：P0 全部、P1-A 内联导出、P1-B `import_rows`（默认关闭）。`resource_link` 大文件下载仍不实施。

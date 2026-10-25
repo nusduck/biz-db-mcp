@@ -1,22 +1,42 @@
-"""Database access for multiple configured MySQL databases."""
+"""Database access: isolated reads, metadata, and the dev-only DML path."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import json
+import re
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-import os
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import pymysql
 import pymysql.cursors
 
-from .config import Credential, DatabaseConfig, Settings
-from .sql_guard import assert_select_only, assert_write_only
+from .config import Settings, table_key
+from .credentials import CredentialStore
+from .errors import (
+    DATABASE_ERROR,
+    DEADLINE_EXCEEDED,
+    INVALID_ARGUMENT,
+    BizDbError,
+    not_accessible,
+)
+from .policy import AccessPolicy, RowFilter, TableInfo, TableRef
+from .sql_guard import assert_write_only, rewrite_select
 
 
 class QueryError(RuntimeError):
-    """Raised when a query fails or violates a guardrail."""
+    """Raised when a dev-only write violates a guardrail."""
+
+
+_store: CredentialStore | None = None
+
+
+def configure(store: CredentialStore) -> None:
+    """Install the startup-resolved credentials used by every connection."""
+    global _store
+    _store = store
 
 
 def _parse_url(dsn: str):
@@ -25,13 +45,7 @@ def _parse_url(dsn: str):
         port = parsed.port or 3306
     except ValueError as exc:
         raise QueryError("invalid MySQL DSN") from exc
-    if parsed.scheme not in ("mysql", "mysql+pymysql"):
-        raise QueryError(f"unsupported DSN scheme: {parsed.scheme!r}")
-    if not parsed.hostname or not parsed.username:
-        raise QueryError("MySQL DSN must include user and host")
     database = unquote((parsed.path or "").lstrip("/"))
-    if not database:
-        raise QueryError("MySQL DSN must include a database name")
     return parsed, port, database
 
 
@@ -47,18 +61,12 @@ def _parse_dsn(dsn: str, *, password: str) -> dict[str, Any]:
     }
 
 
-def _password_for(settings: Settings, credential: Credential) -> str:
-    # Replaced by the startup credential store once DBPM TCP lands.
-    if credential.password_env:
-        password = os.environ.get(credential.password_env, "")
-        if not password:
-            raise QueryError(f"{credential.password_env} is not set")
-        return password
-    raise QueryError("no password source configured for this database")
-
-
-def _connection_kwargs(settings: Settings, database: DatabaseConfig) -> dict[str, Any]:
-    return _parse_dsn(database.dsn, password=_password_for(settings, database.read))
+def _connection_kwargs(settings: Settings, database_id: str, purpose: str) -> dict[str, Any]:
+    if _store is None:
+        raise BizDbError(DATABASE_ERROR, "credentials are not initialized")
+    # The dev-only write path reuses the read credential without READ ONLY.
+    credential = "import" if purpose == "import" else "read"
+    return _store.connect_kwargs(settings.database(database_id).id, credential)  # type: ignore[arg-type]
 
 
 @contextmanager
@@ -69,138 +77,386 @@ def _connection(
     timeout_seconds: int,
     streaming: bool = False,
     autocommit: bool = True,
+    purpose: str = "read",
 ) -> Iterator[Any]:
     database = settings.database(database_id)
     conn = pymysql.connect(
-        **_connection_kwargs(settings, database),
+        **_connection_kwargs(settings, database.id, purpose),
         cursorclass=(
             pymysql.cursors.SSDictCursor if streaming else pymysql.cursors.DictCursor
         ),
         read_timeout=timeout_seconds,
+        write_timeout=timeout_seconds,
         connect_timeout=10,
         autocommit=autocommit,
     )
     try:
         with conn.cursor() as cursor:
-            # This is a server-side bound for SELECT statements. The client
-            # read timeout remains an independent connection safeguard.
-            cursor.execute(f"SET SESSION MAX_EXECUTION_TIME={timeout_seconds * 1000}")
+            # Server-side bound for SELECT; the client read timeout is a
+            # second, independent safeguard.
+            cursor.execute(f"SET SESSION MAX_EXECUTION_TIME={int(timeout_seconds) * 1000}")
+            if purpose == "read":
+                cursor.execute("SET SESSION TRANSACTION READ ONLY")
         yield conn
     except Exception:
         if not autocommit:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
         conn.close()
 
 
-_IDENT_RE = __import__('re').compile(r"^[A-Za-z0-9_]+$")
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_$]{1,64}$")
 
 
 def _validate_identifier(name: str) -> str:
-    if not name or not _IDENT_RE.fullmatch(name):
-        raise QueryError(f"invalid identifier {name!r}")
+    if not isinstance(name, str) or not _IDENT_RE.fullmatch(name):
+        raise BizDbError(INVALID_ARGUMENT, "invalid identifier")
     return name
 
 
-def _quoted_table(table: str) -> str:
-    """Validate and quote a possibly qualified table name `schema.table`.
-
-    Allows `table` or `schema.table`, each part must be [A-Za-z0-9_].
-    Returns a backtick-quoted SQL fragment like `"`schema`"."`table`"`.
-    """
-    if not table or not isinstance(table, str):
-        raise QueryError("invalid table name")
-    raw = table.strip().strip("`").strip()
-    if not raw:
-        raise QueryError("invalid table name")
-    parts = raw.split(".")
-    if len(parts) > 2:
-        raise QueryError(f"invalid table name {table!r}: expected [schema.]table")
-    quoted = ".".join(f"`{_validate_identifier(p.strip().strip('`'))}`" for p in parts)
-    return quoted
+def _split_table(table: str, default_schema: str) -> tuple[str, str]:
+    if not isinstance(table, str):
+        raise BizDbError(INVALID_ARGUMENT, "invalid table name")
+    parts = [part.strip().strip("`") for part in table.strip().split(".")]
+    if len(parts) == 1:
+        return default_schema, _validate_identifier(parts[0])
+    if len(parts) == 2:
+        return _validate_identifier(parts[0]), _validate_identifier(parts[1])
+    raise BizDbError(INVALID_ARGUMENT, "expected table or schema.table")
 
 
-def describe_table(
-    settings: Settings, table: str, *, database: str | None = None
-) -> list[dict[str, Any]]:
-    quoted = _quoted_table(table)
-    timeout = settings.effective_query_timeout(database)
-    with _connection(settings, database, timeout_seconds=timeout) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(f"DESCRIBE {quoted}")
-            return list(cursor.fetchall())
+# ---------------------------------------------------------------------------
+# Metadata and policy glue
+# ---------------------------------------------------------------------------
+
+
+def _table_info(conn: Any, schema: str, table: str) -> TableInfo | None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT TABLE_TYPE AS kind FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            (schema, table),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cursor.execute(
+            "SELECT COLUMN_NAME AS name FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+            (schema, table),
+        )
+        columns = frozenset(str(r["name"]).lower() for r in cursor.fetchall())
+    return TableInfo(kind=str(row["kind"]), columns=columns)
+
+
+def _resolver(
+    settings: Settings, policy: AccessPolicy, database_id: str, conn: Any
+) -> Callable[[str, str], RowFilter | None]:
+    """table_filter callback for rewrite_select bound to one connection."""
+    home = settings.database(database_id).schema.lower()
+
+    def resolve(schema: str, table: str) -> RowFilter | None:
+        explicit = table_key(database_id, schema, table) in settings.isolation.tables
+        # Other schemas on the same server are reachable only by explicit policy.
+        if schema.lower() != home and not explicit:
+            raise not_accessible("table")
+        ref = TableRef(database=database_id, schema=schema, table=table)
+        return policy.table_filter(ref, _table_info(conn, schema, table))
+
+    return resolve
+
+
+def _is_accessible(
+    settings: Settings, policy: AccessPolicy, database_id: str, conn: Any, schema: str, table: str
+) -> bool:
+    try:
+        _resolver(settings, policy, database_id, conn)(schema, table)
+    except BizDbError:
+        return False
+    return True
+
+
+def _translate_db_error(exc: Exception) -> BizDbError:
+    """Map a driver error to a stable code without its (possibly data-bearing) text."""
+    errno = exc.args[0] if exc.args and isinstance(exc.args[0], int) else None
+    if errno in (3024, 1317, 2013):
+        return BizDbError(DEADLINE_EXCEEDED, "query exceeded its time limit")
+    if errno in (1146, 1142, 1143, 1049):
+        return not_accessible("table")
+    hints = {
+        1054: "unknown column",
+        1060: "duplicate column name in the result; alias the columns",
+        1064: "SQL syntax error",
+        1052: "ambiguous column reference",
+        1248: "every derived table needs an alias",
+    }
+    hint = hints.get(errno, "database error")
+    suffix = f" (MySQL {errno})" if errno else ""
+    return BizDbError(DATABASE_ERROR, f"{hint}{suffix}")
+
+
+@contextmanager
+def _db_errors() -> Iterator[None]:
+    try:
+        yield
+    except BizDbError:
+        raise
+    except pymysql.MySQLError as exc:
+        raise _translate_db_error(exc) from None
+
+
+# ---------------------------------------------------------------------------
+# Read tools
+# ---------------------------------------------------------------------------
+
+
+def list_databases(settings: Settings, policy: AccessPolicy) -> list[dict[str, Any]]:
+    out = []
+    for database in settings.databases:
+        try:
+            policy.check_database(database.id)
+        except BizDbError:
+            continue
+        out.append(
+            {
+                "id": database.id,
+                "default": database.id == settings.default_database,
+                "imports_enabled": bool(
+                    settings.imports.enabled and database.allow_imports and policy.scope.allow_imports
+                ),
+            }
+        )
+    return out
 
 
 def list_tables(
     settings: Settings,
+    policy: AccessPolicy,
     *,
     database: str | None = None,
-    schema: str | None = None,
     pattern: str | None = None,
-    include_views: bool = True,
 ) -> list[dict[str, Any]]:
-    """List tables/views visible in the current MySQL database.
-
-    Uses INFORMATION_SCHEMA so it works across MySQL versions without
-    relying on SHOW TABLES parsing. Filtering is done in SQL via LIKE.
-    """
-    timeout = settings.effective_query_timeout(database)
-    # Resolve default schema from DSN when not given
-    if schema is not None:
-        _validate_identifier(schema)
-        schema_filter = schema
-    else:
-        _, _, dsn_db = _parse_url(settings.database(database).dsn)
-        schema_filter = dsn_db
-
+    """Tables and views of the database's schema that this institution may read."""
+    selected = policy.check_database(database)
+    if pattern is not None and (
+        not isinstance(pattern, str)
+        or len(pattern) > 64
+        or not re.fullmatch(r"[A-Za-z0-9_%$]*", pattern)
+    ):
+        raise BizDbError(INVALID_ARGUMENT, "pattern may only contain letters, digits, _, $ and %")
     sql = (
-        "SELECT TABLE_NAME as name, TABLE_TYPE as type, ENGINE as engine, "
-        "TABLE_ROWS as approx_rows, CREATE_TIME as create_time, TABLE_COMMENT as comment "
+        "SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_COMMENT AS comment "
         "FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s"
     )
-    params: list[Any] = [schema_filter]
-    if not include_views:
-        sql += " AND TABLE_TYPE = 'BASE TABLE'"
+    params: list[Any] = [selected.schema]
     if pattern:
-        # Validate pattern is safe for LIKE: allow % _ and alnum
-        if len(pattern) > 64 or any(c in pattern for c in ("'", '"', ";", "\\")):
-            raise QueryError("invalid pattern")
         sql += " AND TABLE_NAME LIKE %s"
         params.append(pattern)
-    sql += " ORDER BY TABLE_NAME LIMIT 1000"
-    with _connection(settings, database, timeout_seconds=timeout) as conn:
+    sql += " ORDER BY TABLE_NAME LIMIT 2000"
+    timeout = settings.effective_query_timeout(selected.id)
+    with _db_errors(), _connection(settings, selected.id, timeout_seconds=timeout) as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params)
-            return list(cursor.fetchall())
+            candidates = list(cursor.fetchall())
+        return [
+            {"name": row["name"], "type": row["type"], "comment": row["comment"]}
+            for row in candidates
+            if _is_accessible(settings, policy, selected.id, conn, selected.schema, row["name"])
+        ]
 
 
-def explain_query(
-    settings: Settings,
-    sql: str,
-    params: list[Any] | None,
-    *,
-    database: str | None = None,
+def describe_table(
+    settings: Settings, policy: AccessPolicy, table: str, *, database: str | None = None
 ) -> list[dict[str, Any]]:
-    """Return MySQL EXPLAIN output for a SELECT without executing it fully.
-
-    Only SELECT/WITH is allowed; the EXPLAIN itself is bounded by the query timeout.
-    """
-    assert_select_only(sql)
-    timeout = settings.effective_query_timeout(database)
-    with _connection(settings, database, timeout_seconds=timeout) as conn:
+    selected = policy.check_database(database)
+    schema, name = _split_table(table, selected.schema)
+    timeout = settings.effective_query_timeout(selected.id)
+    with _db_errors(), _connection(settings, selected.id, timeout_seconds=timeout) as conn:
+        _resolver(settings, policy, selected.id, conn)(schema, name)
         with conn.cursor() as cursor:
-            cursor.execute(f"EXPLAIN {sql}", params or [])
+            cursor.execute(
+                "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, "
+                "COLUMN_KEY AS `key`, COLUMN_DEFAULT AS `default`, COLUMN_COMMENT AS comment "
+                "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                "ORDER BY ORDINAL_POSITION",
+                (schema, name),
+            )
             return list(cursor.fetchall())
+
+
+def _bounded_select(sql: str, args: tuple[Any, ...], limit: int, offset: int) -> tuple[str, tuple[Any, ...]]:
+    """Let MySQL stop producing rows: the limit is enforced by the server."""
+    return (
+        f"SELECT * FROM ({sql}) AS `_bizdb_q` LIMIT %s OFFSET %s",
+        (*args, limit, offset),
+    )
 
 
 def _query_limit(settings: Settings, limit: int | None, database: str | None = None) -> int:
     cap = settings.effective_query_max_rows(database)
     if limit is None:
         return cap
-    if isinstance(limit, bool) or limit < 1:
-        raise QueryError("limit must be a positive integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise BizDbError(INVALID_ARGUMENT, "limit must be a positive integer")
     return min(limit, cap)
+
+
+MAX_OFFSET = 100_000
+
+
+def _json_size(row: dict[str, Any]) -> int:
+    return len(json.dumps(row, ensure_ascii=False, default=str).encode("utf-8")) + 1
+
+
+def run_query(
+    settings: Settings,
+    policy: AccessPolicy,
+    sql: str,
+    params: list[Any] | None,
+    limit: int | None,
+    *,
+    database: str | None = None,
+    offset: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run one isolated SELECT bounded by rows, serialized bytes, and time.
+
+    dry_run validates the SQL and resolves table access (which needs
+    metadata) without executing the statement.
+    """
+    selected = policy.check_database(database)
+    if offset is not None and (
+        isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= MAX_OFFSET
+    ):
+        raise BizDbError(INVALID_ARGUMENT, f"offset must be an integer between 0 and {MAX_OFFSET}")
+    row_limit = _query_limit(settings, limit, selected.id)
+    max_bytes = settings.limits.query.max_bytes
+    timeout = settings.effective_query_timeout(selected.id)
+    with _db_errors(), _connection(
+        settings, selected.id, timeout_seconds=timeout, streaming=True
+    ) as conn:
+        rewritten, args = rewrite_select(
+            sql,
+            params,
+            default_schema=selected.schema,
+            table_filter=_resolver(settings, policy, selected.id, conn),
+        )
+        if dry_run:
+            return {
+                "dry_run": True,
+                "database": selected.id,
+                "effective_limit": row_limit,
+                "effective_timeout": timeout,
+                "offset": offset or 0,
+            }
+        bounded, bounded_args = _bounded_select(rewritten, args, row_limit + 1, offset or 0)
+        rows: list[dict[str, Any]] = []
+        size = 0
+        truncated_reason: str | None = None
+        with conn.cursor() as cursor:
+            cursor.execute(bounded, bounded_args)
+            for row in cursor:
+                if len(rows) >= row_limit:
+                    truncated_reason = "row_limit"
+                    break
+                row_size = _json_size(row)
+                if size + row_size > max_bytes:
+                    truncated_reason = "byte_limit"
+                    break
+                size += row_size
+                rows.append(row)
+    return {
+        "database": selected.id,
+        "row_count": len(rows),
+        "offset": offset or 0,
+        "limit": row_limit,
+        "truncated": truncated_reason is not None,
+        "truncated_reason": truncated_reason,
+        "rows": rows,
+    }
+
+
+def explain_query(
+    settings: Settings,
+    policy: AccessPolicy,
+    sql: str,
+    params: list[Any] | None,
+    *,
+    database: str | None = None,
+) -> list[dict[str, Any]]:
+    """EXPLAIN the isolated form of a SELECT; the plan reflects the real filters."""
+    selected = policy.check_database(database)
+    timeout = settings.effective_query_timeout(selected.id)
+    with _db_errors(), _connection(settings, selected.id, timeout_seconds=timeout) as conn:
+        rewritten, args = rewrite_select(
+            sql,
+            params,
+            default_schema=selected.schema,
+            table_filter=_resolver(settings, policy, selected.id, conn),
+        )
+        with conn.cursor() as cursor:
+            cursor.execute(f"EXPLAIN {rewritten}", args)
+            return list(cursor.fetchall())
+
+
+@dataclass
+class ExportSource:
+    """Rows of one isolated export plus the column metadata to type the file."""
+
+    rows: Iterator[dict[str, Any]]
+    columns: list[Any]
+
+
+@contextmanager
+def export_rows(
+    settings: Settings,
+    policy: AccessPolicy,
+    sql: str,
+    params: list[Any] | None,
+    *,
+    database: str | None = None,
+) -> Iterator[ExportSource]:
+    """Stream an isolated SELECT, bounded server-side to max_rows + 1 rows."""
+    from .export import column_meta_from_cursor
+
+    selected = policy.check_database(database)
+    timeout = settings.effective_export_timeout(selected.id)
+    max_rows = settings.effective_export_max_rows(selected.id)
+    with _db_errors(), _connection(
+        settings, selected.id, timeout_seconds=timeout, streaming=True
+    ) as conn:
+        rewritten, args = rewrite_select(
+            sql,
+            params,
+            default_schema=selected.schema,
+            table_filter=_resolver(settings, policy, selected.id, conn),
+        )
+        bounded, bounded_args = _bounded_select(rewritten, args, max_rows + 1, 0)
+        with conn.cursor() as cursor:
+            cursor.execute(bounded, bounded_args)
+            yield ExportSource(rows=iter(cursor), columns=column_meta_from_cursor(cursor))
+
+
+@contextmanager
+def import_connection(settings: Settings, database_id: str) -> Iterator[Any]:
+    """A non-autocommit connection with the restricted import account."""
+    with _connection(
+        settings,
+        database_id,
+        timeout_seconds=settings.limits.import_.timeout_seconds,
+        autocommit=False,
+        purpose="import",
+    ) as conn:
+        yield conn
+
+
+# ---------------------------------------------------------------------------
+# Dev-only generic DML (registered only for stdio with writes.enabled)
+# ---------------------------------------------------------------------------
 
 
 def _extract_dml_table(sql: str) -> str | None:
@@ -299,89 +555,6 @@ def _resolve_write_require_where(settings: Settings, sql: str, database: str | N
     return True
 
 
-def run_query(
-    settings: Settings,
-    sql: str,
-    params: list[Any] | None,
-    limit: int | None,
-    *,
-    database: str | None = None,
-    offset: int | None = None,
-    dry_run: bool = False,
-) -> list[dict[str, Any]] | dict[str, Any]:
-    """Run a bounded exploratory query using a server-side cursor.
-
-    When dry_run=True, returns {dry_run: True, sql, params, effective_limit, effective_timeout}
-    without hitting the database, useful for preflight.
-    """
-    assert_select_only(sql)
-    if offset is not None:
-        if isinstance(offset, bool) or offset < 0:
-            raise QueryError("offset must be a non-negative integer")
-    row_limit = _query_limit(settings, limit, database)
-    timeout = settings.effective_query_timeout(database)
-    if dry_run:
-        return {
-            "dry_run": True,
-            "sql": sql,
-            "params": params or [],
-            "effective_limit": row_limit,
-            "effective_timeout": timeout,
-            "offset": offset or 0,
-            "database": settings.database(database).id,
-        }
-    # DictCursor buffers the complete result during execute(). Streaming here
-    # makes the output limit a client-memory bound as well as a response bound.
-    with _connection(
-        settings,
-        database,
-        timeout_seconds=timeout,
-        streaming=True,
-    ) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, params or [])
-            rows: list[dict[str, Any]] = []
-            skipped = 0
-            target_offset = offset or 0
-            for row in cursor:
-                if skipped < target_offset:
-                    skipped += 1
-                    continue
-                rows.append(row)
-                if len(rows) >= row_limit:
-                    break
-            return rows
-
-
-def stream_query(
-    settings: Settings,
-    sql: str,
-    params: list[Any] | None,
-    *,
-    database: str | None = None,
-    on_description: Any = None,
-) -> Iterator[dict[str, Any]]:
-    """Yield rows one at a time via a server-side cursor.
-
-    If given, *on_description* is called once with the DB-API cursor
-    description (column name/type metadata) right after the query executes
-    and before the first row is yielded, so callers can derive a fixed
-    output schema instead of inferring one from streamed row batches.
-    """
-    assert_select_only(sql)
-    with _connection(
-        settings,
-        database,
-        timeout_seconds=settings.effective_export_timeout(database),
-        streaming=True,
-    ) as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, params or [])
-            if on_description is not None:
-                on_description(cursor.description)
-            yield from cursor
-
-
 def execute_write(
     settings: Settings,
     sql: str,
@@ -409,7 +582,7 @@ def execute_write(
         # executing the DML and rolling back (unsafe for MyISAM / triggers).
         try:
             timeout = settings.effective_query_timeout(selected.id)
-            with _connection(settings, selected.id, timeout_seconds=timeout) as conn:
+            with _connection(settings, selected.id, timeout_seconds=timeout, purpose="write") as conn:
                 with conn.cursor() as cursor:
                     # EXPLAIN on DML works on MySQL 8.0.19+; on older versions this raises
                     cursor.execute(f"EXPLAIN {sql}", params or [])
@@ -430,6 +603,7 @@ def execute_write(
         selected.id,
         timeout_seconds=settings.write_timeout_seconds,
         autocommit=False,
+        purpose="write",
     ) as conn:
         with conn.cursor() as cursor:
             conn.begin()
@@ -487,6 +661,7 @@ def execute_many(
         selected.id,
         timeout_seconds=settings.write_timeout_seconds,
         autocommit=False,
+        purpose="write",
     ) as conn:
         with conn.cursor() as cursor:
             conn.begin()

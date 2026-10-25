@@ -2,16 +2,12 @@ import pyarrow.parquet as pq
 import pytest
 
 from biz_db_mcp import export as export_module
-from biz_db_mcp.config import load_settings
+from conftest import make_settings
 from biz_db_mcp.export import ExportError, export_to_parquet
 
 
 def _settings(monkeypatch, max_rows="10"):
-    monkeypatch.setenv("BIZDB_MYSQL_DSN", "mysql://u:p@localhost:3306/app")
-    monkeypatch.setenv("BIZDB_SANDBOX_BASE_URL", "http://sandbox:8000")
-    monkeypatch.setenv("BIZDB_SANDBOX_API_TOKEN", "token")
-    monkeypatch.setenv("BIZDB_EXPORT_MAX_ROWS", max_rows)
-    return load_settings()
+    return make_settings({"limits": {"export": {"max_rows": int(max_rows)}}})
 
 
 def test_export_writes_streamed_rows_in_batches(monkeypatch):

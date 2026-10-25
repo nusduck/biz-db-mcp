@@ -6,9 +6,9 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import db, sandbox_client
+from . import db
 from .audit import log_call
-from .config import load_export_identity, load_settings
+from .config import load_settings
 from .export import export_to_parquet
 
 
@@ -144,24 +144,7 @@ def export(
     fmt = format.lower().strip() if isinstance(format, str) else "parquet"
     if fmt not in ("parquet", "csv", "jsonl"):
         raise ValueError(f"unsupported format {fmt!r}; use parquet, csv, or jsonl")
-    with log_call("export", database=database, sql=sql, dataset_name=dataset_name, format=fmt):
-        sandbox_client._dataset_filename(dataset_name, fmt)  # fail fast, before the export runs
-        settings = _get_settings()
-        identity = load_export_identity()
-        tmp_path, row_count = export_to_parquet(
-            settings, sql, params, database=database, format=fmt  # type: ignore[arg-type]
-        )
-        result = sandbox_client.push_dataset(
-            settings,
-            identity=identity,
-            dataset_name=dataset_name,
-            file_path=tmp_path,
-            format=fmt,
-        )
-        result["database"] = settings.database(database).id
-        result["row_count"] = row_count
-        result["format"] = fmt
-        return result
+    raise NotImplementedError("export is being moved to MCP embedded resources")
 
 
 def main() -> None:

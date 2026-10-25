@@ -4,15 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import lru_cache
+import os
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import pymysql
 import pymysql.cursors
 
-from .config import DatabaseConfig, DbpmSettings, Settings
-from .dbpm import CommandPasswordProvider, PasswordProvider
+from .config import Credential, DatabaseConfig, Settings
 from .sql_guard import assert_select_only, assert_write_only
 
 
@@ -36,14 +35,9 @@ def _parse_url(dsn: str):
     return parsed, port, database
 
 
-def _parse_dsn(dsn: str, *, password_override: str | None = None) -> dict[str, Any]:
-    """Parse mysql://user:pass@host:port/db into pymysql kwargs."""
+def _parse_dsn(dsn: str, *, password: str) -> dict[str, Any]:
+    """Parse a passwordless mysql://user@host:port/db into pymysql kwargs."""
     parsed, port, database = _parse_url(dsn)
-    password = password_override
-    if password is None and parsed.password is not None:
-        password = unquote(parsed.password)
-    if password is None:
-        raise QueryError("MySQL DSN requires a password when DBPM is disabled")
     return {
         "host": parsed.hostname,
         "port": port,
@@ -53,25 +47,18 @@ def _parse_dsn(dsn: str, *, password_override: str | None = None) -> dict[str, A
     }
 
 
-def _dbpm_identity(database: DatabaseConfig) -> tuple[str, str]:
-    parsed, _, dsn_database = _parse_url(database.dsn)
-    return (
-        database.dbpm_database or dsn_database,
-        database.dbpm_user or unquote(parsed.username or ""),
-    )
-
-
-@lru_cache(maxsize=1)
-def _dbpm_provider(settings: DbpmSettings) -> PasswordProvider:
-    return CommandPasswordProvider(settings)
+def _password_for(settings: Settings, credential: Credential) -> str:
+    # Replaced by the startup credential store once DBPM TCP lands.
+    if credential.password_env:
+        password = os.environ.get(credential.password_env, "")
+        if not password:
+            raise QueryError(f"{credential.password_env} is not set")
+        return password
+    raise QueryError("no password source configured for this database")
 
 
 def _connection_kwargs(settings: Settings, database: DatabaseConfig) -> dict[str, Any]:
-    password_override: str | None = None
-    if settings.dbpm.enabled:
-        db_name, db_user = _dbpm_identity(database)
-        password_override = _dbpm_provider(settings.dbpm).get_password(db_name, db_user)
-    return _parse_dsn(database.dsn, password_override=password_override)
+    return _parse_dsn(database.dsn, password=_password_for(settings, database.read))
 
 
 @contextmanager

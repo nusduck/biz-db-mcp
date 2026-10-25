@@ -45,7 +45,7 @@ def test_institution_codes_must_be_quoted_and_normalized():
 
 
 def test_export_limit_cannot_exceed_platform_file_result_cap():
-    with pytest.raises(ConfigError, match="max_bytes must be <="):
+    with pytest.raises(ConfigError, match="max_bytes must be at most 20MiB"):
         make_settings({"limits": {"export": {"max_bytes": 20 * 1024 * 1024 + 1}}})
 
 
@@ -80,3 +80,28 @@ def test_auth_token_must_be_present(monkeypatch):
     monkeypatch.delenv("BIZDB_MCP_TOKEN", raising=False)
     with pytest.raises(ConfigError, match="BIZDB_MCP_TOKEN"):
         auth_token(settings)
+
+
+@pytest.mark.parametrize(
+    ("text", "size"),
+    [(1024, 1024), ("1024", 1024), ("64KiB", 65536), ("64kb", 65536), ("20MiB", 20 * 1024**2),
+     ("20 MB", 20 * 1024**2), ("20M", 20 * 1024**2), ("1G", 1024**3), ("1.5KiB", 1536)],
+)
+def test_sizes_accept_units(text, size):
+    from biz_db_mcp.config import parse_size
+
+    assert parse_size(text, "x") == size
+
+
+@pytest.mark.parametrize("bad", ["20 apples", "-1MiB", "", True, "1.3B", "MiB"])
+def test_bad_sizes_are_rejected(bad):
+    from biz_db_mcp.config import parse_size
+
+    with pytest.raises(ConfigError, match="x must be"):
+        parse_size(bad, "x")
+
+
+def test_readable_sizes_in_settings():
+    settings = make_settings({"limits": {"export": {"max_bytes": "5MiB"}, "query": {"max_bytes": "512KB"}}})
+    assert settings.limits.export.max_bytes == 5 * 1024 * 1024
+    assert settings.limits.query.max_bytes == 512 * 1024

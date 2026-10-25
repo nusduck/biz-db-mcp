@@ -417,6 +417,54 @@ def _req_int(raw: dict[str, Any], key: str, where: str, default: int, **kw: Any)
     return value
 
 
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:I?B)?\s*$", re.IGNORECASE)
+_SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def parse_size(value: Any, where: str) -> int:
+    """A byte count: an integer, or a string such as "20MiB", "512KB", "1.5G".
+
+    Units are binary (1 KB = 1 KiB = 1024 bytes), matching the platform's MiB limits.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f"{where} must be a size such as 20MiB")
+    if isinstance(value, int):
+        return value
+    match = _SIZE_RE.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        raise ConfigError(f"{where} must be a size such as 20MiB, 512KB or 1G")
+    number, unit = match.groups()
+    size = float(number) * _SIZE_UNITS[unit.upper()]
+    if size != int(size):
+        raise ConfigError(f"{where} must be a whole number of bytes")
+    return int(size)
+
+
+def _size(
+    raw: dict[str, Any],
+    key: str,
+    where: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
+    value = parse_size(raw.get(key, default), f"{where}.{key}")
+    if value < minimum:
+        raise ConfigError(f"{where}.{key} must be at least {human_size(minimum)}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{where}.{key} must be at most {human_size(maximum)}")
+    return value
+
+
+def human_size(size: int) -> str:
+    """Readable binary size, e.g. 20MiB; exact bytes when not a whole unit."""
+    for unit, factor in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if size >= factor and size % factor == 0:
+            return f"{size // factor}{unit}"
+    return f"{size} bytes"
+
+
 def _str(raw: dict[str, Any], key: str, where: str, default: str | None = None) -> str | None:
     value = raw.get(key, default)
     if value is None:
@@ -478,7 +526,7 @@ def _parse_server(raw: Any) -> ServerSettings:
         port=_req_int(raw, "port", where, 8080, maximum=65535),
         auth_token_env=token_env,
         allowed_hosts=_str_list(raw, "allowed_hosts", where),
-        max_request_bytes=_req_int(raw, "max_request_bytes", where, 16 * MIB),
+        max_request_bytes=_size(raw, "max_request_bytes", where, 16 * MIB),
         tool_deadline_seconds=_req_int(raw, "tool_deadline_seconds", where, 150),
     )
 
@@ -489,7 +537,7 @@ def _parse_limits(raw: Any) -> Limits:
     q = _mapping(raw.get("query"), "limits.query", {"max_rows", "max_bytes", "timeout_seconds"})
     query = QueryLimits(
         max_rows=_req_int(q, "max_rows", "limits.query", 200),
-        max_bytes=_req_int(q, "max_bytes", "limits.query", 1 * MIB),
+        max_bytes=_size(q, "max_bytes", "limits.query", 1 * MIB),
         timeout_seconds=_req_int(q, "timeout_seconds", "limits.query", 10),
     )
 
@@ -500,7 +548,7 @@ def _parse_limits(raw: Any) -> Limits:
     )
     export = ExportLimits(
         max_rows=_req_int(e, "max_rows", "limits.export", 100_000),
-        max_bytes=_req_int(
+        max_bytes=_size(
             e, "max_bytes", "limits.export", 20 * MIB, maximum=PLATFORM_FILE_RESULT_MAX_BYTES
         ),
         timeout_seconds=_req_int(e, "timeout_seconds", "limits.export", 120),
@@ -513,12 +561,12 @@ def _parse_limits(raw: Any) -> Limits:
         {"max_bytes", "max_rows", "max_columns", "max_field_bytes", "timeout_seconds"},
     )
     import_ = ImportLimits(
-        max_bytes=_req_int(
+        max_bytes=_size(
             i, "max_bytes", "limits.import", 10 * MIB, maximum=PLATFORM_ARTIFACT_MAX_BYTES
         ),
         max_rows=_req_int(i, "max_rows", "limits.import", 50_000),
         max_columns=_req_int(i, "max_columns", "limits.import", 256),
-        max_field_bytes=_req_int(i, "max_field_bytes", "limits.import", 64 * 1024),
+        max_field_bytes=_size(i, "max_field_bytes", "limits.import", 64 * 1024),
         timeout_seconds=_req_int(i, "timeout_seconds", "limits.import", 120),
     )
 
@@ -695,7 +743,7 @@ def _parse_log_file(raw: Any, where: str, base_dir: Path) -> LogFileSettings:
     path = _str(raw, "path", where)
     return LogFileSettings(
         path=_resolve_path(path, base_dir) if path else None,
-        max_bytes=_req_int(raw, "max_bytes", where, 10 * MIB, minimum=_MIN_LOG_FILE_BYTES),
+        max_bytes=_size(raw, "max_bytes", where, 10 * MIB, minimum=_MIN_LOG_FILE_BYTES),
         # Python's RotatingFileHandler never rotates with backup_count 0, so
         # at least one backup is required for the size bound to hold.
         backup_count=_req_int(raw, "backup_count", where, 5, minimum=1, maximum=100),

@@ -27,7 +27,7 @@ from pydantic import Field
 
 from . import db
 from .audit import log_call
-from .config import ConfigError, Settings, auth_token, load_settings
+from .config import ConfigError, Settings, auth_token, human_size, load_settings
 from .credentials import CredentialStore
 from .errors import (
     DEADLINE_EXCEEDED,
@@ -257,20 +257,22 @@ _EXPORT_DESCRIPTION = """Export an institution-filtered SELECT as a file returne
 
 The file is returned as an embedded resource that the platform saves to the
 workspace. Exports over the row or byte limit fail as TOO_LARGE rather than
-being truncated. Limits: {max_rows} rows, {max_bytes} bytes."""
+being truncated. Limits: {max_rows} rows, {max_bytes} bytes ({max_human})."""
 
 _IMPORT_DESCRIPTION = """Import a CSV/JSONL/Parquet file into a whitelisted table for this institution.
 
 Rows are written for the caller's institution only, in one transaction.
 Resubmitting the same file returns status=duplicate instead of writing twice.
 dry_run (default true) validates without writing. Maximum decoded file size:
-{max_bytes} bytes (base64 length up to {max_base64} characters); at most
-{max_rows} rows."""
+{max_bytes} bytes ({max_human}; base64 length up to {max_base64} characters);
+at most {max_rows} rows."""
 
 
 def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) -> None:
     description = _EXPORT_DESCRIPTION.format(
-        max_rows=settings.limits.export.max_rows, max_bytes=settings.limits.export.max_bytes
+        max_rows=settings.limits.export.max_rows,
+        max_bytes=settings.limits.export.max_bytes,
+        max_human=human_size(settings.limits.export.max_bytes),
     )
 
     @mcp.tool(structured_output=False, description=description)
@@ -314,7 +316,10 @@ def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
 def _register_import_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) -> None:
     limit = settings.limits.import_.max_bytes
     description = _IMPORT_DESCRIPTION.format(
-        max_bytes=limit, max_base64=4 * -(-limit // 3), max_rows=settings.limits.import_.max_rows
+        max_bytes=limit,
+        max_human=human_size(limit),
+        max_base64=4 * -(-limit // 3),
+        max_rows=settings.limits.import_.max_rows,
     )
 
     @mcp.tool(structured_output=False, description=description)

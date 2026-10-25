@@ -66,7 +66,7 @@ DSN 中带口令会被拒绝。主要配置块：
 | `logging` | `level`、`stderr`；`audit` / `app` 两个文件各自的 `path`、`max_bytes`、`backup_count`（按大小轮转，`backup_count ≥ 1`） |
 | `storage` | `temp_dir` 导出暂存目录、`stale_temp_seconds` 启动时清理残留的阈值 |
 
-文件中的相对路径都相对配置文件所在目录解析。
+文件中的相对路径都相对配置文件所在目录解析。大小类配置可写整数字节或带单位，如 `64KiB`、`20MiB`、`1G`（按 1024 换算，`MB` 与 `MiB` 相同）。
 
 ### 存储占用
 
@@ -128,6 +128,8 @@ biz-db-mcp --config /etc/biz-db-mcp/config.yaml --transport streamable-http --ho
   "fileResults": {"maxBytes": 20971520}
 }
 ```
+
+平台清单的 `maxBytes` 是平台格式，只能写整数字节：10 MiB = `10485760`，20 MiB = `20971520`。
 
 启用导入前：DBA 执行 [migrations/001_import_ledger.sql](migrations/001_import_ledger.sql)，按其中模板给独立导入账号授权；核对目标表唯一约束含机构列。启动时会检查账本表，缺失则拒绝启动。
 

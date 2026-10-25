@@ -1,4 +1,5 @@
 # biz-db-mcp configuration. Copy to config.yaml (git-ignored) and edit.
+# Sizes accept units: 512KB, 20MiB, 1G (binary: 1KB = 1024 bytes).
 # Loaded once at startup; restart to apply changes. Path: --config, then
 # $BIZDB_CONFIG, then ./config.yaml. Unknown keys are rejected.
 #
@@ -11,13 +12,13 @@ server:
   port: 8080                      # endpoint path is /mcp
   auth_token_env: BIZDB_MCP_TOKEN # platform authTokenRef uses the same name
   allowed_hosts: []               # Host header allowlist, e.g. ["bizdb-mcp.internal.example"]
-  max_request_bytes: 16777216     # 16 MiB: a 10 MiB import as base64 plus JSON
+  max_request_bytes: 16MiB        # a 10MiB import as base64 plus JSON
   tool_deadline_seconds: 150      # must stay below the platform timeoutMs (180 s)
 
 limits:                           # per process; with N replicas the total is N x these
-  query:  {max_rows: 200, max_bytes: 1048576, timeout_seconds: 10}
-  export: {max_rows: 100000, max_bytes: 20971520, timeout_seconds: 120, row_batch_size: 20000}
-  import: {max_bytes: 10485760, max_rows: 50000, max_columns: 256, max_field_bytes: 65536, timeout_seconds: 120}
+  query:  {max_rows: 200, max_bytes: 1MiB, timeout_seconds: 10}
+  export: {max_rows: 100000, max_bytes: 20MiB, timeout_seconds: 120, row_batch_size: 20000}
+  import: {max_bytes: 10MiB, max_rows: 50000, max_columns: 256, max_field_bytes: 64KiB, timeout_seconds: 120}
   concurrency: {total: 4, per_institution: 2, export: 1, import: 1}
   rate: {per_minute: 60, burst: 10}   # per normalized institution code
 
@@ -27,12 +28,12 @@ logging:
   stderr: true                    # also write both streams to stderr (container logs)
   audit:                          # one JSON line per tool call, no SQL/params/data
     path: /var/log/biz-db-mcp/audit.log
-    max_bytes: 10485760           # rotate at 10 MiB
-    backup_count: 5               # keep 5 old files -> at most 60 MiB on disk
+    max_bytes: 10MiB              # rotate at 10MiB
+    backup_count: 5               # keep 5 old files -> at most 60MiB on disk
   app:
     path: /var/log/biz-db-mcp/server.log
-    max_bytes: 10485760
-    backup_count: 3               # at most 40 MiB
+    max_bytes: 10MiB
+    backup_count: 3               # at most 40MiB
 
 storage:
   temp_dir: /var/lib/biz-db-mcp/tmp   # export staging; omit for the system temp dir

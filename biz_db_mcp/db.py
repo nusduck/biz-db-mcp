@@ -97,6 +97,12 @@ def _connection(
             cursor.execute(f"SET SESSION MAX_EXECUTION_TIME={int(timeout_seconds) * 1000}")
             if purpose == "read":
                 cursor.execute("SET SESSION TRANSACTION READ ONLY")
+                # Rewritten SQL is generated assuming backslash escapes and
+                # backtick identifiers; pin the mode instead of trusting it.
+                cursor.execute(
+                    "SET SESSION sql_mode = REPLACE(REPLACE(@@SESSION.sql_mode, "
+                    "'NO_BACKSLASH_ESCAPES', ''), 'ANSI_QUOTES', '')"
+                )
         yield conn
     except Exception:
         if not autocommit:
@@ -288,14 +294,6 @@ def describe_table(
             return list(cursor.fetchall())
 
 
-def _bounded_select(sql: str, args: tuple[Any, ...], limit: int, offset: int) -> tuple[str, tuple[Any, ...]]:
-    """Let MySQL stop producing rows: the limit is enforced by the server."""
-    return (
-        f"SELECT * FROM ({sql}) AS `_bizdb_q` LIMIT %s OFFSET %s",
-        (*args, limit, offset),
-    )
-
-
 def _query_limit(settings: Settings, limit: int | None, database: str | None = None) -> int:
     cap = settings.effective_query_max_rows(database)
     if limit is None:
@@ -339,11 +337,14 @@ def run_query(
     with _db_errors(), _connection(
         settings, selected.id, timeout_seconds=timeout, streaming=True
     ) as conn:
+        # limit + 1 rows tells a full page apart from a truncated one.
         rewritten, args = rewrite_select(
             sql,
             params,
             default_schema=selected.schema,
             table_filter=_resolver(settings, policy, selected.id, conn),
+            row_limit=row_limit + 1,
+            offset=offset or 0,
         )
         if dry_run:
             return {
@@ -353,12 +354,11 @@ def run_query(
                 "effective_timeout": timeout,
                 "offset": offset or 0,
             }
-        bounded, bounded_args = _bounded_select(rewritten, args, row_limit + 1, offset or 0)
         rows: list[dict[str, Any]] = []
         size = 0
         truncated_reason: str | None = None
         with conn.cursor() as cursor:
-            cursor.execute(bounded, bounded_args)
+            cursor.execute(rewritten, args)
             for row in cursor:
                 if len(rows) >= row_limit:
                     truncated_reason = "row_limit"
@@ -434,10 +434,10 @@ def export_rows(
             params,
             default_schema=selected.schema,
             table_filter=_resolver(settings, policy, selected.id, conn),
+            row_limit=max_rows + 1,
         )
-        bounded, bounded_args = _bounded_select(rewritten, args, max_rows + 1, 0)
         with conn.cursor() as cursor:
-            cursor.execute(bounded, bounded_args)
+            cursor.execute(rewritten, args)
             yield ExportSource(rows=iter(cursor), columns=column_meta_from_cursor(cursor))
 
 

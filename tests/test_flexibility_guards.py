@@ -230,13 +230,20 @@ def test_execute_dry_run_does_not_execute_dml_when_explain_fails(monkeypatch):
     assert executed[0].startswith("EXPLAIN")
 
 
-# ---- P2: offset validation before dry_run ----
+# ---- P2: offset validation before any database access ----
 
 def test_query_offset_validation_before_dry_run(monkeypatch):
+    from biz_db_mcp.errors import BizDbError
+    from biz_db_mcp.institution import parse_institution
+    from biz_db_mcp.policy import AccessPolicy
+
     settings = make_settings()
+    policy = AccessPolicy(settings, parse_institution("00002000"))
 
-    with pytest.raises(QueryError, match="offset"):
-        db.run_query(settings, "SELECT 1", None, limit=10, offset=-7, dry_run=True)
+    def no_connection(*a, **kw):
+        raise AssertionError("must not connect")
 
-    with pytest.raises(QueryError, match="offset"):
-        db.run_query(settings, "SELECT 1", None, limit=10, offset=-1, dry_run=False)
+    monkeypatch.setattr(db, "_connection", no_connection)
+    for bad in (-7, -1, db.MAX_OFFSET + 1):
+        with pytest.raises(BizDbError, match="offset"):
+            db.run_query(settings, policy, "SELECT 1", None, limit=10, offset=bad, dry_run=True)

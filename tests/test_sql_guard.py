@@ -442,3 +442,43 @@ def test_rewrite_with_no_tables_keeps_the_statement():
     assert out == "SELECT 1"
     assert args == ()
     assert _format(out, args) == "SELECT 1"
+
+
+# ---- server-side row bound (added during integration) ----
+
+def _filter_a(schema, table):
+    from biz_db_mcp.policy import RowFilter
+
+    return RowFilter("ins_id_cd", ("A",))
+
+
+def test_row_limit_is_attached_without_breaking_order_by():
+    from biz_db_mcp.sql_guard import rewrite_select
+
+    out, args = rewrite_select(
+        "SELECT a FROM t ORDER BY a", None, default_schema="app",
+        table_filter=_filter_a, row_limit=11, offset=5,
+    )
+    assert out.endswith("ORDER BY `a` LIMIT 11 OFFSET 5")
+    assert args == ("A",)
+
+
+def test_query_with_its_own_limit_is_wrapped():
+    from biz_db_mcp.sql_guard import rewrite_select
+
+    out, args = rewrite_select(
+        "SELECT a FROM t ORDER BY a LIMIT %s", [3], default_schema="app",
+        table_filter=_filter_a, row_limit=201,
+    )
+    assert out.startswith("SELECT * FROM (SELECT `a` FROM")
+    assert out.endswith("ORDER BY `a` LIMIT %s) AS `_bizdb_q` LIMIT 201")
+    assert args == ("A", 3)
+
+
+def test_control_characters_are_rejected():
+    from biz_db_mcp.errors import BizDbError
+    from biz_db_mcp.sql_guard import rewrite_select
+
+    with pytest.raises(BizDbError, match="control characters"):
+        rewrite_select("SELECT * FROM t\x00", None, default_schema="app", table_filter=_filter_a)
+    rewrite_select("SELECT *\n\tFROM t", None, default_schema="app", table_filter=_filter_a)

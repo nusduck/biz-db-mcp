@@ -575,23 +575,57 @@ def _render(expression: exp.Expression, values: dict[str, Any]) -> tuple[str, tu
     return "".join(pieces), tuple(args)
 
 
+def _apply_row_limit(expression: exp.Expression, row_limit: int, offset: int) -> exp.Expression:
+    """Bound the result in SQL so MySQL stops producing rows.
+
+    A query without its own LIMIT/OFFSET gets them attached directly, which
+    keeps its ORDER BY meaningful. A query that already limits itself is
+    wrapped, because ORDER BY + LIMIT inside a derived table is honoured.
+    """
+    if isinstance(row_limit, bool) or not isinstance(row_limit, int) or row_limit < 1:
+        raise BizDbError(INVALID_ARGUMENT, "row limit must be a positive integer")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise BizDbError(INVALID_ARGUMENT, "offset must be a non-negative integer")
+    if expression.args.get("limit") is not None or expression.args.get("offset") is not None:
+        expression = exp.Select(
+            expressions=[exp.Star()],
+            from_=exp.From(
+                this=exp.Subquery(
+                    this=expression, alias=exp.TableAlias(this=exp.to_identifier("_bizdb_q"))
+                )
+            ),
+        )
+    expression.set("limit", exp.Limit(expression=exp.Literal.number(row_limit)))
+    if offset:
+        expression.set("offset", exp.Offset(expression=exp.Literal.number(offset)))
+    return expression
+
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def rewrite_select(
     sql: str,
     params: Sequence[Any] | None,
     *,
     default_schema: str,
     table_filter: Callable[[str, str], RowFilter | None],
+    row_limit: int | None = None,
+    offset: int = 0,
 ) -> tuple[str, tuple[Any, ...]]:
     """Rewrite one SELECT so every base table is row-filtered.
 
     Returns SQL with pymysql-style ``%s`` placeholders and the positional
     arguments in placeholder order. ``table_filter`` may raise
-    :class:`BizDbError`; it propagates unchanged.
+    :class:`BizDbError`; it propagates unchanged. With ``row_limit`` the
+    statement is also bounded server-side (see ``_apply_row_limit``).
     """
     if not isinstance(sql, str) or not sql.strip():
         raise _rejected("SQL must be a non-empty string")
     if len(sql) > MAX_SELECT_LENGTH:
         raise _rejected("SQL is too long")
+    if _CONTROL_CHARACTERS.search(sql):
+        raise _rejected("control characters are not allowed")
 
     params_tuple = _coerce_params(params)
     # Scan before tokenizing so a comment that also makes sqlglot's tokenizer
@@ -635,4 +669,6 @@ def rewrite_select(
             filter_index=filter_index,
         )
 
+    if row_limit is not None:
+        expression = _apply_row_limit(expression, row_limit, offset)
     return _render(expression, values)

@@ -350,3 +350,15 @@ URI 用于标识/文件名，不表示模型需要调用 `resources/read` 下载
 | 12 | 驱动异常文本可能含列值/SQL 片段 | 对外只返回稳定错误码 + MySQL 错误号与固定提示；1146/1142 等映射为与跨机构一致的 `RESOURCE_NOT_ACCESSIBLE` |
 
 本轮实施范围：P0 全部、P1-A 内联导出、P1-B `import_rows`（默认关闭）。`resource_link` 大文件下载仍不实施。
+
+### 13.1 实施结果与已知限制（2026-10-25）
+
+已实现并有单测覆盖：config.yaml、机构号归一、Streamable HTTP + Bearer + 请求体上限、异步工具与准入闸门、DBPM 原生 TCP 启动取密、表替换式行级隔离、SQL 层 LIMIT、内联导出、`import_rows` 与幂等账本。真实 CLI 已在本机以 HTTP 启动并用假 DBPM 验证：无 token 401、`tools/list`、未知机构拒绝、注释注入拒绝、审计只含 SQL 摘要。**尚未**做：真实 MySQL 上的事务/权限/并发验证，以及平台真实账号的端到端联调（§12 验收矩阵中需要真实环境的项均未完成）。
+
+已知限制：
+
+- SQL 不支持 `NATURAL`/`USING` 连接、索引提示、`PARTITION`、表函数、`%s` 以外的占位符；`FROM DUAL` 会被当作普通表而拒绝（`SELECT 1` 不带 FROM 可用）。
+- 结果列重名在导出时报错，需在 SELECT 中起别名。
+- upsert 的文件内重复键按 Python 等值判断，MySQL 在不区分大小写的排序规则下可能把 `abc`/`ABC` 视为同一键：不会越权，但返回的 inserted/updated 计数可能偏差。
+- 读取外键父子表的机构归属不推导；非公共表必须自带机构列或显式配置。
+- 并发与速率是每实例预算；多副本需平台/网关统一限额。

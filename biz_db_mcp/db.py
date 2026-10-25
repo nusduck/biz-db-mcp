@@ -176,6 +176,14 @@ def _resolver(
     return resolve
 
 
+def _prevalidate(sql: str, params: list[Any] | None, default_schema: str) -> None:
+    """Reject malformed or forbidden SQL before opening a database connection.
+
+    Table access still needs metadata and is decided by the real rewrite.
+    """
+    rewrite_select(sql, params, default_schema=default_schema, table_filter=lambda *_: None)
+
+
 def _is_accessible(
     settings: Settings, policy: AccessPolicy, database_id: str, conn: Any, schema: str, table: str
 ) -> bool:
@@ -333,6 +341,7 @@ def run_query(
         raise BizDbError(INVALID_ARGUMENT, f"offset must be an integer between 0 and {MAX_OFFSET}")
     row_limit = _query_limit(settings, limit, selected.id)
     max_bytes = settings.limits.query.max_bytes
+    _prevalidate(sql, params, selected.schema)
     timeout = settings.effective_query_timeout(selected.id)
     with _db_errors(), _connection(
         settings, selected.id, timeout_seconds=timeout, streaming=True
@@ -390,6 +399,7 @@ def explain_query(
 ) -> list[dict[str, Any]]:
     """EXPLAIN the isolated form of a SELECT; the plan reflects the real filters."""
     selected = policy.check_database(database)
+    _prevalidate(sql, params, selected.schema)
     timeout = settings.effective_query_timeout(selected.id)
     with _db_errors(), _connection(settings, selected.id, timeout_seconds=timeout) as conn:
         rewritten, args = rewrite_select(
@@ -425,6 +435,7 @@ def export_rows(
 
     selected = policy.check_database(database)
     timeout = settings.effective_export_timeout(selected.id)
+    _prevalidate(sql, params, selected.schema)
     max_rows = settings.effective_export_max_rows(selected.id)
     with _db_errors(), _connection(
         settings, selected.id, timeout_seconds=timeout, streaming=True

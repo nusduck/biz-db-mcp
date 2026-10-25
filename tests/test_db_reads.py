@@ -154,3 +154,15 @@ def test_driver_errors_are_redacted():
     err = db._translate_db_error(pymysql.err.OperationalError(1054, "Unknown column 'secret_value'"))
     assert "secret_value" not in str(err) and "1054" in str(err)
     assert db._translate_db_error(pymysql.err.ProgrammingError(1146, "x")).code == RESOURCE_NOT_ACCESSIBLE
+
+
+def test_forbidden_sql_is_rejected_before_connecting(monkeypatch):
+    def no_connection(*a, **kw):
+        raise AssertionError("must not connect")
+
+    monkeypatch.setattr(db, "_connection", no_connection)
+    settings = _settings()
+    for sql in ("SELECT /*! 1 */ 2", "SELECT * FROM t FOR UPDATE", "DELETE FROM orders"):
+        with pytest.raises(BizDbError) as excinfo:
+            db.run_query(settings, _policy(settings), sql, None, limit=1)
+        assert excinfo.value.code == "SQL_REJECTED"

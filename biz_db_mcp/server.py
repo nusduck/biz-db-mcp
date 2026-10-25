@@ -250,10 +250,27 @@ def _register_read_tools(mcp: FastMCP, settings: Settings, runner: ToolRunner) -
         )
 
 
-def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) -> None:
-    max_mib = settings.limits.export.max_bytes / (1024 * 1024)
+_EXPORT_DESCRIPTION = """Export an institution-filtered SELECT as a file returned in the result.
 
-    @mcp.tool(structured_output=False)
+The file is returned as an embedded resource that the platform saves to the
+workspace. Exports over the row or byte limit fail as TOO_LARGE rather than
+being truncated. Limits: {max_rows} rows, {max_bytes} bytes."""
+
+_IMPORT_DESCRIPTION = """Import a CSV/JSONL/Parquet file into a whitelisted table for this institution.
+
+Rows are written for the caller's institution only, in one transaction.
+Resubmitting the same file returns status=duplicate instead of writing twice.
+dry_run (default true) validates without writing. Maximum decoded file size:
+{max_bytes} bytes (base64 length up to {max_base64} characters); at most
+{max_rows} rows."""
+
+
+def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) -> None:
+    description = _EXPORT_DESCRIPTION.format(
+        max_rows=settings.limits.export.max_rows, max_bytes=settings.limits.export.max_bytes
+    )
+
+    @mcp.tool(structured_output=False, description=description)
     async def export(
         sql: Annotated[str, Field(description="One SELECT whose rows become the file.")],
         dataset_name: Annotated[str, Field(description="File name without directories.")],
@@ -262,12 +279,6 @@ def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
         database: DatabaseId = None,
         format: Annotated[str, Field(description="parquet (default), csv or jsonl")] = "parquet",
     ) -> list[Any]:
-        """Export an institution-filtered SELECT as a file returned in the result.
-
-        The file is returned as an embedded resource that the platform saves to
-        the workspace. Exports over the row or byte limit fail as TOO_LARGE
-        rather than being truncated.
-        """
         fmt = format.lower().strip() if isinstance(format, str) else ""
         if fmt not in ("parquet", "csv", "jsonl"):
             raise BizDbError(INVALID_ARGUMENT, "format must be parquet, csv, or jsonl")
@@ -295,13 +306,14 @@ def _register_export_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
             "export", instituteid, body, kind="export", database=database, sql=sql, format=fmt
         )
 
-    export.__doc__ = (export.__doc__ or "") + f"\n        Maximum file size: {max_mib:g} MiB."
-
 
 def _register_import_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) -> None:
     limit = settings.limits.import_.max_bytes
+    description = _IMPORT_DESCRIPTION.format(
+        max_bytes=limit, max_base64=4 * -(-limit // 3), max_rows=settings.limits.import_.max_rows
+    )
 
-    @mcp.tool(structured_output=False)
+    @mcp.tool(structured_output=False, description=description)
     async def import_rows(
         instituteid: InstituteId,
         database: Annotated[str, Field(description="Database id")],
@@ -313,12 +325,6 @@ def _register_import_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
         format: Annotated[str | None, Field(description="csv, jsonl or parquet; inferred from filename")] = None,
         dry_run: Annotated[bool, Field(description="Validate only; set false to write")] = True,
     ) -> str:
-        """Import a CSV/JSONL/Parquet file into a whitelisted table for this institution.
-
-        Rows are written for the caller's institution only, in one transaction.
-        Resubmitting the same file returns status=duplicate instead of writing
-        twice. dry_run (default true) validates without writing.
-        """
 
         def body(_policy: AccessPolicy, institution: Institution, deadline: float) -> Any:
             request = ImportRequest(
@@ -356,11 +362,6 @@ def _register_import_tool(mcp: FastMCP, settings: Settings, runner: ToolRunner) 
             file_length=len(file_base64) if isinstance(file_base64, str) else None,
         )
         return _text(_import_payload(result))
-
-    import_rows.__doc__ = (import_rows.__doc__ or "") + (
-        f"\n        Maximum decoded file size: {limit} bytes "
-        f"(base64 length up to {4 * -(-limit // 3)} characters)."
-    )
 
 
 def _import_payload(result: Any) -> dict[str, Any]:

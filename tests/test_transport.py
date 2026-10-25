@@ -101,3 +101,77 @@ def test_length_prefixed_and_bare_codes_are_the_same_institution(client):
         )
         assert called["result"]["isError"] is False
         assert '"primary"' in called["result"]["content"][0]["text"]
+
+
+def test_export_returns_embedded_resource_through_mcp(monkeypatch):
+    import base64
+    import hashlib
+    from contextlib import contextmanager
+
+    from pymysql.constants import FIELD_TYPE
+
+    from biz_db_mcp import db
+    from biz_db_mcp.export import ColumnMeta
+
+    @contextmanager
+    def fake_export_rows(settings, policy, sql, params, *, database=None):
+        yield db.ExportSource(
+            rows=iter([{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]),
+            columns=[ColumnMeta("id", FIELD_TYPE.LONG), ColumnMeta("name", FIELD_TYPE.VAR_STRING)],
+        )
+
+    monkeypatch.setattr(db, "export_rows", fake_export_rows)
+    app = build_http_app(create_server(make_settings()), token=TOKEN, max_request_bytes=4096)
+    with TestClient(app) as client:
+        _post(client, INIT)
+        called = _json_body(
+            _post(
+                client,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "export",
+                        "arguments": {
+                            "sql": "SELECT id, name FROM orders",
+                            "dataset_name": "订单 2024",
+                            "instituteid": "0800002000",
+                            "format": "csv",
+                        },
+                    },
+                },
+            )
+        )
+    result = called["result"]
+    assert result["isError"] is False
+    text, resource = result["content"]
+    assert text["type"] == "text" and "rows=2" in text["text"]
+    assert resource["type"] == "resource"
+    blob = base64.b64decode(resource["resource"]["blob"])
+    assert blob.decode() == "id,name\r\n1,a\r\n2,b\r\n"
+    assert resource["resource"]["mimeType"] == "text/csv"
+    assert resource["resource"]["uri"].endswith("/%E8%AE%A2%E5%8D%95%202024.csv")
+    assert hashlib.sha256(blob).hexdigest() in text["text"]
+
+
+def test_import_tool_is_registered_only_when_enabled():
+    settings = make_settings({
+        "databases": {"primary": {
+            "allow_imports": True,
+            "import_credential": {"dsn": "mysql://importer@localhost:3306/app", "password_env": "TEST_DB_PASSWORD"},
+        }},
+        "imports": {"enabled": True, "tables": {"primary:app.report_results": {
+            "modes": ["insert"], "columns": ["metric", "value"], "institution_column": "ins_id_cd",
+        }}},
+    })
+    app = build_http_app(create_server(settings), token=TOKEN, max_request_bytes=4096)
+    with TestClient(app) as client:
+        _post(client, INIT)
+        listed = _json_body(_post(client, {"jsonrpc": "2.0", "id": 6, "method": "tools/list"}))
+    tool = {t["name"]: t for t in listed["result"]["tools"]}["import_rows"]
+    schema = tool["inputSchema"]
+    assert set(schema["required"]) >= {
+        "instituteid", "database", "table", "file_base64", "filename", "content_sha256", "mode",
+    }
+    assert "10485760 bytes" in tool["description"]

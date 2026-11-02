@@ -97,8 +97,30 @@ DSN 中带口令会被拒绝。主要配置块：
 
 ## 部署
 
+### 安装
+
+需要 Python 3.11 及以上。不依赖 uv，用标准 pip 即可：
+
 ```bash
-python3 -m pip install -e '.[dev]'
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 生产：按锁定版本安装（与 uv.lock 一致）
+python3 -m pip install -r requirements.txt
+python3 -m pip install . --no-deps
+
+# 开发：锁定版本 + pytest，项目以可编辑模式安装
+python3 -m pip install -r requirements-dev.txt
+python3 -m pip install -e . --no-deps
+```
+
+也可以直接 `python3 -m pip install -e '.[dev]'`，但这只按 `pyproject.toml` 的版本范围解析，装出的版本可能比锁文件新。
+
+`requirements*.txt` 由 `uv.lock` 导出。修改依赖后需用文件头中的 `uv export` 命令重新生成，保持两者一致。
+
+### 启动
+
+```bash
 python3 -m pytest
 export BIZDB_MCP_TOKEN=...            # 只有平台持有
 biz-db-mcp --config /etc/biz-db-mcp/config.yaml --transport streamable-http --host 0.0.0.0 --port 8080
